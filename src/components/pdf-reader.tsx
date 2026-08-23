@@ -37,6 +37,36 @@ export const HIGHLIGHT_HEX: Record<AnnotationColor, string> = {
 type Box = { left: number; top: number; width: number; height: number };
 
 /**
+ * Internal PDF links (references, section/figure/equation cross-refs) point
+ * at a page PLUS a precise vertical offset within it — jumping to just the
+ * page leaves the target wherever it happens to fall, often scrolled well
+ * past the top. Destination arrays follow the PDF spec: [pageRef, {name:
+ * fitType}, ...params], where the vertical offset (in PDF points, measured
+ * from the page's bottom) lives at a different index depending on fitType.
+ */
+function destTopFraction(dest: unknown, pagePointsHeight: number | null): number {
+  if (!pagePointsHeight || !Array.isArray(dest) || dest.length < 2) return 0;
+  const fit = dest[1] as { name?: string } | undefined;
+  let top: unknown;
+  switch (fit?.name) {
+    case "XYZ":
+      top = dest[3]; // [ref, {XYZ}, left, top, zoom]
+      break;
+    case "FitH":
+    case "FitBH":
+      top = dest[2]; // [ref, {FitH}, top]
+      break;
+    case "FitR":
+      top = dest[5]; // [ref, {FitR}, left, bottom, right, top]
+      break;
+    default:
+      top = null; // Fit / FitB / FitV / FitBV — no meaningful vertical offset
+  }
+  if (typeof top !== "number" || Number.isNaN(top)) return 0;
+  return Math.min(1, Math.max(0, 1 - top / pagePointsHeight));
+}
+
+/**
  * Merges selection fragments that sit on the same text line into one span,
  * but only when the horizontal gap between them is small (≤ half a character
  * height). Large whitespace gaps — such as between widely spaced author
@@ -131,6 +161,11 @@ export function PdfReader({
   // gets a real one from the browser, but proper PDF viewers fake it anyway
   // so a click gives some visual confirmation of exactly where it landed.
   const [caret, setCaret] = useState<Caret | null>(null);
+  // Tracks "the user is navigating a placed text caret" independent of
+  // whether one is currently rendered — Shift+Arrow can turn the caret into
+  // a real (non-collapsed) selection, which hides the fake caret, but a
+  // further plain Arrow can collapse it back and the caret should reappear.
+  const caretModeRef = useRef(false);
   const [comment, setComment] = useState("");
   const [color, setColor] = useState<AnnotationColor>("yellow");
   const [saving, setSaving] = useState(false);
@@ -140,6 +175,16 @@ export function PdfReader({
   // since every page forces its own full-resolution canvas paint.
   const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set([1]));
   const [pageAspect, setPageAspect] = useState<number | null>(null);
+  // Unscaled page height in PDF points — used to convert a link's
+  // destination (a PDF-space Y offset) into a fraction of the page.
+  const [pagePointsHeight, setPagePointsHeight] = useState<number | null>(null);
+  // react-pdf's <Document> caches its onItemClick handler in a useRef on
+  // first mount and never refreshes it, so a plain closure over
+  // pagePointsHeight would forever see the value from before any page
+  // loaded (null). Route through a ref so the frozen closure still reads
+  // the latest value at call time.
+  const pagePointsHeightRef = useRef<number | null>(null);
+  pagePointsHeightRef.current = pagePointsHeight;
   const [hoverPointer, setHoverPointer] = useState(false);
   const observerRef = useRef<IntersectionObserver | null>(null);
 
@@ -220,18 +265,32 @@ export function PdfReader({
     setPending(null);
     setFocused(null);
     setCaret(null);
+    caretModeRef.current = false;
     setCommenting(false);
     setComment("");
   }, []);
 
-  const scrollToPage = useCallback((n: number) => {
+  const scrollToPage = useCallback((n: number, fraction = 0, center = false) => {
     const el = pageRefs.current[n];
     const container = scrollRef.current;
     if (!el || !container) return;
-    container.scrollTo({
-      top: el.offsetTop - container.offsetTop - 8,
-      behavior: "smooth",
+    // Jumping straight to a page (e.g. a reference/figure link) can land
+    // somewhere the lazy-load observer hasn't reached yet — render it (and
+    // its immediate neighbors) immediately instead of showing a placeholder
+    // until scrolling nudges the observer.
+    setVisiblePages((prev) => {
+      const next = new Set(prev);
+      next.add(n - 1);
+      next.add(n);
+      next.add(n + 1);
+      return next;
     });
+    const targetY = el.offsetTop - container.offsetTop + fraction * el.offsetHeight;
+    // Precise in-page links (references/figures/equations) center the target
+    // in the viewport instead of pinning it to the top edge, so it's visible
+    // and unambiguous even if the destination sits low on a short page.
+    const top = center ? targetY - container.clientHeight / 2 : targetY - 8;
+    container.scrollTo({ top, behavior: "smooth" });
   }, []);
 
   /** Tracks which page is mostly in view so the toolbar counter stays accurate. */
@@ -255,6 +314,7 @@ export function PdfReader({
       return;
     }
     setCaret(null);
+    caretModeRef.current = false;
     const range = sel.getRangeAt(0);
     // Drop the sliver rects browsers emit at line wraps / range edges.
     const raw = Array.from(range.getClientRects()).filter((r) => r.width > 4 && r.height > 6);
@@ -326,20 +386,89 @@ export function PdfReader({
     });
   }, [commenting]);
 
+  // Once a caret is placed (by clicking text) and the user starts navigating
+  // it with arrow keys (below, via Selection.modify()), the fake caret
+  // overlay has to be kept in sync with wherever the real selection ends up.
   useEffect(() => {
+    function onSelectionChange() {
+      if (!caretModeRef.current) return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) {
+        setCaret(null);
+        return;
+      }
+      if (!sel.isCollapsed) {
+        // Shift+Arrow turned it into a real selection — the selection
+        // highlight itself is the visual indicator now, not a caret. Caret
+        // mode stays on, though: a further plain Arrow can collapse the
+        // selection back down, and the caret should reappear when it does.
+        setCaret(null);
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      const entry = Object.entries(pageRefs.current).find(
+        ([, el]) => el && el.contains(range.commonAncestorContainer),
+      );
+      if (!entry) {
+        setCaret(null);
+        caretModeRef.current = false;
+        return;
+      }
+      const [pageKey, host] = entry;
+      if (!host) return;
+      // getBoundingClientRect() can come back zero-height right at certain
+      // line-boundary caret positions (e.g. just after collapsing a
+      // "line"-extended selection) — getClientRects() often still has a
+      // usable individual rect even then.
+      let r = range.getBoundingClientRect();
+      if (r.height === 0) {
+        const rects = range.getClientRects();
+        r = rects[0] ?? r;
+      }
+      if (r.height === 0) return; // still nothing usable — keep the last known position
+      const box = host.getBoundingClientRect();
+      setCaret({ page: Number(pageKey), top: r.top - box.top, left: r.left - box.left, height: r.height });
+    }
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => document.removeEventListener("selectionchange", onSelectionChange);
+  }, []);
+
+  useEffect(() => {
+    const ARROW_DIRECTION: Record<string, "left" | "right" | "backward" | "forward"> = {
+      ArrowLeft: "left",
+      ArrowRight: "right",
+      ArrowUp: "backward",
+      ArrowDown: "forward",
+    };
+
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
         window.getSelection()?.removeAllRanges();
         dismiss();
         return;
       }
-      // Shift+Arrow extends the text selection — never hijack it for paging.
-      if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
       const target = e.target as HTMLElement | null;
       const typing =
         !!target &&
         (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
       if (typing) return;
+
+      // A caret placed in the text (from clicking it) takes over all four
+      // arrow keys — plain moves it, Shift+ extends a real selection from
+      // it — the same as any ordinary selectable text elsewhere on the web.
+      // Browsers don't do this automatically for non-editable content the
+      // way they do for an <input>, so it's driven explicitly here via the
+      // Selection API's own move/extend rather than reimplementing cursor
+      // placement by hand.
+      const direction = ARROW_DIRECTION[e.key];
+      if (caretModeRef.current && direction && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const granularity = e.key === "ArrowUp" || e.key === "ArrowDown" ? "line" : "character";
+        window.getSelection()?.modify(e.shiftKey ? "extend" : "move", direction, granularity);
+        return;
+      }
+
+      if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
       const sel = window.getSelection();
       if (sel && !sel.isCollapsed) return;
       if (e.key === "ArrowRight" || e.key === "PageDown") {
@@ -428,11 +557,13 @@ export function PdfReader({
             left: r.left - box.left,
             height: r.height,
           });
+          caretModeRef.current = true;
         }
       }
       return;
     }
     setCaret(null);
+    caretModeRef.current = false;
     const { hit, box } = found;
     const lastRect = hit.rects[hit.rects.length - 1]!;
     onSelectAnnotation?.(hit.id);
@@ -539,6 +670,10 @@ export function PdfReader({
           file={src}
           onLoadSuccess={({ numPages: n }) => setNumPages(n)}
           onLoadError={() => setFailed(true)}
+          onItemClick={({ dest, pageNumber }) => {
+            const fraction = destTopFraction(dest, pagePointsHeightRef.current);
+            scrollToPage(pageNumber, fraction, true);
+          }}
           loading={
             <div className="flex items-center gap-2 p-8 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" /> Loading PDF…
@@ -579,6 +714,7 @@ export function PdfReader({
                       renderAnnotationLayer
                       onLoadSuccess={(p) => {
                         if (pageAspect === null) setPageAspect(p.width / p.height);
+                        if (pagePointsHeight === null) setPagePointsHeight(p.originalHeight);
                       }}
                     />
                   ) : (
