@@ -82,6 +82,13 @@ type Focused = {
   left: number;
 };
 
+type Caret = {
+  page: number;
+  top: number;
+  left: number;
+  height: number;
+};
+
 export function PdfReader({
   url,
   annotations,
@@ -120,10 +127,21 @@ export function PdfReader({
   const [failed, setFailed] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
   const [focused, setFocused] = useState<Focused | null>(null);
+  // A fake blinking text caret — plain (non-editable) selectable text never
+  // gets a real one from the browser, but proper PDF viewers fake it anyway
+  // so a click gives some visual confirmation of exactly where it landed.
+  const [caret, setCaret] = useState<Caret | null>(null);
   const [comment, setComment] = useState("");
   const [color, setColor] = useState<AnnotationColor>("yellow");
   const [saving, setSaving] = useState(false);
   const [commenting, setCommenting] = useState(false);
+  // Pages actually render lazily (see the IntersectionObserver below) —
+  // rendering all of them up front was the main cause of a sluggish reader,
+  // since every page forces its own full-resolution canvas paint.
+  const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set([1]));
+  const [pageAspect, setPageAspect] = useState<number | null>(null);
+  const [hoverPointer, setHoverPointer] = useState(false);
+  const observerRef = useRef<IntersectionObserver | null>(null);
 
   useLayoutEffect(() => {
     const el = outerRef.current;
@@ -133,6 +151,36 @@ export function PdfReader({
     setAvailable(el.clientWidth);
     return () => ro.disconnect();
   }, []);
+
+  useEffect(() => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        setVisiblePages((prev) => {
+          let changed = false;
+          const next = new Set(prev);
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const n = Number((entry.target as HTMLElement).dataset.page);
+            if (!next.has(n)) {
+              next.add(n);
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+      },
+      // Preload roughly one extra screen above/below so pages are ready just
+      // before they're scrolled into view, instead of popping in late.
+      { root, rootMargin: "700px 0px" },
+    );
+    observerRef.current = io;
+    for (const el of Object.values(pageRefs.current)) {
+      if (el) io.observe(el);
+    }
+    return () => io.disconnect();
+  }, [numPages]);
 
   // The reader box is sized to hug the page exactly, but the scroll pane's
   // own vertical scrollbar (always present once a page renders — pages are
@@ -171,6 +219,7 @@ export function PdfReader({
   const dismiss = useCallback(() => {
     setPending(null);
     setFocused(null);
+    setCaret(null);
     setCommenting(false);
     setComment("");
   }, []);
@@ -205,10 +254,40 @@ export function PdfReader({
       if (!commenting) setPending(null);
       return;
     }
+    setCaret(null);
     const range = sel.getRangeAt(0);
-    const entry = Object.entries(pageRefs.current).find(
-      ([, el]) => el && el.contains(range.commonAncestorContainer),
-    );
+    // Drop the sliver rects browsers emit at line wraps / range edges.
+    const raw = Array.from(range.getClientRects()).filter((r) => r.width > 4 && r.height > 6);
+    if (raw.length === 0) return;
+
+    // Guard against runaway selections. Releasing the drag just below the
+    // last line of a page — easy to do, since text rarely fills all the way
+    // to the page edge — can make the browser's selection anchor snap back
+    // to the very start of the page's text layer instead of stopping where
+    // the drag actually ended, turning a small intended selection into one
+    // spanning most of the page. A real highlight is a few lines at most, so
+    // reject anything whose vertical span is clearly not that.
+    const top = Math.min(...raw.map((r) => r.top));
+    const bottom = Math.max(...raw.map((r) => r.bottom));
+    if (bottom - top > 600) {
+      if (!commenting) setPending(null);
+      return;
+    }
+
+    // Attribute the selection to whichever page contains its first rect (the
+    // visual start of the drag). Using the range's commonAncestorContainer
+    // for this breaks the moment a selection is dragged across a page
+    // boundary — in a continuous-scroll view that's an easy thing to do by
+    // accident — since the common ancestor then sits above every page and
+    // matches none of them, silently dropping the whole selection.
+    const first = raw[0]!;
+    const cx = first.left + first.width / 2;
+    const cy = first.top + first.height / 2;
+    const entry = Object.entries(pageRefs.current).find(([, el]) => {
+      if (!el) return false;
+      const box = el.getBoundingClientRect();
+      return cx >= box.left && cx <= box.right && cy >= box.top && cy <= box.bottom;
+    });
     if (!entry) return;
     const [pageKey, host] = entry;
     if (!host) return;
@@ -216,10 +295,16 @@ export function PdfReader({
     if (!quote) return;
 
     const box = host.getBoundingClientRect();
-    // Drop the sliver rects browsers emit at line wraps / range edges, then
-    // merge same-line fragments so punctuation gaps disappear.
-    const raw = Array.from(range.getClientRects()).filter((r) => r.width > 4 && r.height > 6);
-    const merged = mergeLineRects(raw);
+    // A selection dragged past this page's edge still reports rects for the
+    // next page too — keep only the ones that actually fall on this page,
+    // rather than normalizing nonsense coordinates from the wrong page.
+    const onThisPage = raw.filter((r) => {
+      const rcy = r.top + r.height / 2;
+      return rcy >= box.top - 2 && rcy <= box.bottom + 2;
+    });
+    if (onThisPage.length === 0) return;
+    // Merge same-line fragments so punctuation gaps disappear.
+    const merged = mergeLineRects(onThisPage);
     const rects: Rect[] = merged.map((r) => ({
       x: (r.left - box.left) / box.width,
       y: (r.top - box.top) / box.height,
@@ -302,11 +387,9 @@ export function PdfReader({
    * The PDF text layer sits above the highlight layer (so text stays selectable),
    * so highlight clicks are hit-tested here against the stored rects instead.
    */
-  function handlePageClick(e: React.MouseEvent<HTMLDivElement>, n: number) {
-    const sel = window.getSelection();
-    if (sel && !sel.isCollapsed) return;
+  function findHitAnnotation(e: { clientX: number; clientY: number }, n: number) {
     const host = pageRefs.current[n];
-    if (!host) return;
+    if (!host) return null;
     const box = host.getBoundingClientRect();
     const px = (e.clientX - box.left) / box.width;
     const py = (e.clientY - box.top) / box.height;
@@ -315,10 +398,42 @@ export function PdfReader({
         a.page === n &&
         a.rects.some((r) => px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h),
     );
-    if (!hit) {
+    return hit ? { hit, box } : null;
+  }
+
+  function isOverHighlight(e: React.MouseEvent, n: number): boolean {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return false;
+    return findHitAnnotation(e, n) !== null;
+  }
+
+  function handlePageClick(e: React.MouseEvent<HTMLDivElement>, n: number) {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    const found = findHitAnnotation(e, n);
+    if (!found) {
       if (focused) dismiss();
+      // A plain click on ordinary text: the browser already collapsed the
+      // selection to that exact spot, so read its position back out and
+      // show a fake blinking caret there — real text-selection carets only
+      // render in editable content, never in plain selectable text like this.
+      const host = pageRefs.current[n];
+      if (host && sel && sel.rangeCount > 0) {
+        const r = sel.getRangeAt(0).getBoundingClientRect();
+        if (r.height > 0) {
+          const box = host.getBoundingClientRect();
+          setCaret({
+            page: n,
+            top: r.top - box.top,
+            left: r.left - box.left,
+            height: r.height,
+          });
+        }
+      }
       return;
     }
+    setCaret(null);
+    const { hit, box } = found;
     const lastRect = hit.rects[hit.rects.length - 1]!;
     onSelectAnnotation?.(hit.id);
     setPending(null);
@@ -436,23 +551,51 @@ export function PdfReader({
               const pageAnnotations = annotations.filter(
                 (a) => a.page === n && a.rects.length > 0,
               );
+              const isVisible = visiblePages.has(n);
+              const placeholderHeight = pageAspect ? pageWidth / pageAspect : pageWidth * 1.3;
               return (
                 <div
                   key={n}
+                  data-page={n}
                   ref={(el) => {
                     pageRefs.current[n] = el;
+                    const io = observerRef.current;
+                    if (!io) return;
+                    if (el) io.observe(el);
                   }}
                   className="pdf-page relative w-fit shadow-sm"
                   onMouseUp={captureSelection}
                   onTouchEnd={captureSelection}
                   onClick={(e) => handlePageClick(e, n)}
+                  onMouseMove={(e) => setHoverPointer(isOverHighlight(e, n))}
+                  onMouseLeave={() => setHoverPointer(false)}
+                  style={isVisible ? { cursor: hoverPointer ? "pointer" : undefined } : undefined}
                 >
-                  <Page
-                    pageNumber={n}
-                    width={pageWidth}
-                    devicePixelRatio={renderDpr}
-                    renderAnnotationLayer={false}
-                  />
+                  {isVisible ? (
+                    <Page
+                      pageNumber={n}
+                      width={pageWidth}
+                      devicePixelRatio={renderDpr}
+                      renderAnnotationLayer
+                      onLoadSuccess={(p) => {
+                        if (pageAspect === null) setPageAspect(p.width / p.height);
+                      }}
+                    />
+                  ) : (
+                    <div
+                      className="flex items-center justify-center bg-card"
+                      style={{ width: pageWidth, height: placeholderHeight }}
+                    >
+                      <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+                    </div>
+                  )}
+
+                  {caret && caret.page === n && (
+                    <span
+                      className="pdf-caret"
+                      style={{ top: caret.top, left: caret.left, height: caret.height }}
+                    />
+                  )}
 
                   <div className="pdf-highlight-layer">
                     {pageAnnotations.map((a) => (

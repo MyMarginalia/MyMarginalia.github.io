@@ -240,7 +240,6 @@
 .pdf-highlight {
   position: absolute;
   pointer-events: none;
-  cursor: pointer;
   border-radius: 2px;
   opacity: 0.18;
   mix-blend-mode: multiply;
@@ -267,4 +266,20 @@
 .pdf-page .textLayer ::-moz-selection {
   background: color-mix(in oklab, #f5d742 25%, transparent);
   color: transparent;
+}
+
+/* Fake text caret — plain selectable (non-editable) text never gets a real
+   blinking cursor from the browser, so a click fakes one for visual feedback. */
+.pdf-caret {
+  position: absolute;
+  width: 1px;
+  pointer-events: none;
+  background: var(--color-primary);
+  z-index: 3;
+  animation: pdf-caret-blink 1s step-end infinite;
+}
+
+@keyframes pdf-caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
 }
