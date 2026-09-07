@@ -414,7 +414,13 @@ export async function updateAnnotation(
     throw new Error("Annotation not found.");
   }
 
-  if (patch.comment !== undefined) existing.comment = patch.comment || null;
+  if (patch.comment !== undefined) {
+    existing.comment = patch.comment || null;
+    // Keep kind in step with reality: it was set once at creation, so a
+    // highlight that later gained a note stayed labelled "highlight" (and
+    // vice versa) for the rest of its life.
+    existing.kind = existing.comment ? "note" : "highlight";
+  }
   if (patch.color !== undefined) existing.color = patch.color;
   existing.updated_at = new Date().toISOString();
 

@@ -229,7 +229,9 @@
   display: block;
 }
 
-/* Highlights sit under the text layer so text stays crisp and selectable. */
+/* Highlights sit under the text layer so text stays crisp and selectable.
+   Hit-testing for hover and clicks is done in JS against the stored rects,
+   since the text layer above would swallow the events either way. */
 .pdf-highlight-layer {
   position: absolute;
   inset: 0;
@@ -237,21 +239,40 @@
   z-index: 1;
 }
 
+/* Blending and opacity belong to the group, not to each rect. A letter
+   carrying a diacritic — an overbar in a discretised matrix, say — is two
+   separate glyphs in the PDF and so produces two overlapping rects; with the
+   blend on each rect, the overlap multiplied against the page twice and came
+   out visibly darker than the rest of the highlight. Setting opacity on the
+   group flattens its rects into one buffer first, so any overlap composites
+   exactly once no matter how the glyphs are split. */
+.pdf-highlight-group {
+  position: absolute;
+  inset: 0;
+  mix-blend-mode: multiply;
+  opacity: var(--highlight-alpha, 0.32);
+  transition: opacity 120ms ease;
+}
+
+.pdf-highlight-group.is-active {
+  opacity: calc(var(--highlight-alpha, 0.32) + 0.23);
+}
+
 .pdf-highlight {
   position: absolute;
-  pointer-events: none;
   border-radius: 2px;
-  opacity: 0.18;
-  mix-blend-mode: multiply;
 }
 
-.pdf-highlight:hover {
-  opacity: 0.18;
-}
-
-.pdf-highlight-active {
-  opacity: 0.3;
-  outline: 1px solid var(--color-primary);
+/* A small corner tick marking a highlight that carries a note, so annotated
+   passages are findable without hovering every one of them. */
+.pdf-note-dot {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  margin: -3px 0 0 -4px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  box-shadow: 0 0 0 1.5px var(--color-card);
 }
 
 .pdf-page .textLayer {
