@@ -160,6 +160,28 @@ export function PdfReader({
     return () => ro.disconnect();
   }, []);
 
+  // Height is measured rather than a fixed vh: at 80vh the reader plus the
+  // header, toolbar and footer added up to more than the window, so the page
+  // scrolled behind a pane that was itself scrolling — two scrollbars for one
+  // document. Filling the space actually left below the pane gives one.
+  const [paneHeight, setPaneHeight] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const el = scrollRef.current;
+      if (!el) return;
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      // Fill the space left below the pane. Reserving the footer as well would
+      // cost about a hundred pixels of reading area to save a short scroll
+      // that only reveals the footer, so the footer is left below the fold and
+      // overscroll containment (see the pane's class) keeps a scroll inside
+      // the reader from spilling out to the page.
+      setPaneHeight(Math.max(360, Math.round(window.innerHeight - top - 24)));
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [available]);
+
   // The pane reserves its own scrollbar width on platforms that don't overlay
   // them, so the frame can hug the page instead of overflowing by that much.
   useEffect(() => {
@@ -173,7 +195,12 @@ export function PdfReader({
     document.body.removeChild(outer);
   }, []);
 
-  const paneChrome = scrollbarWidth;
+  // The frame draws a 1px border on each side, and the pane reserves its own
+  // scrollbar where the platform doesn't overlay them. Both come out of the
+  // width budget; leaving the border out made every page 2px wider than the
+  // space it had, so the pane always had a stray horizontal scrollbar.
+  const FRAME_BORDER = 2;
+  const paneChrome = scrollbarWidth + FRAME_BORDER;
   /** The 100%-zoom reading width; the frame is sized from this, not from zoom. */
   const baseWidth = Math.max(280, Math.min(860, Math.floor(available - paneChrome)));
   const pageWidth = Math.max(
@@ -497,12 +524,12 @@ export function PdfReader({
         <div
           ref={scrollRef}
           onScroll={onScroll}
-          className="max-h-[80vh] overflow-auto bg-muted/30"
+          className="pdf-scroll-pane overscroll-contain overflow-auto bg-muted/30"
           // Pages mount and unmount as they scroll in and out of range, and the
           // browser's scroll anchoring reacts by silently adjusting scrollTop,
           // which fights deliberate scrolls. Placeholders already hold each
           // page's exact height, so there is nothing to anchor against.
-          style={{ overflowAnchor: "none" }}
+          style={{ overflowAnchor: "none", height: paneHeight ?? undefined }}
         >
           <Document
             file={src}
