@@ -8,6 +8,12 @@ import {
   type SetStateAction,
 } from "react";
 import { buildPageLines, positionInLine, type PageLines } from "@/lib/pdf/text-geometry";
+import {
+  buildLineCursors,
+  cursorForSelection,
+  nearestCursor,
+  type LineCursors,
+} from "@/lib/pdf/line-cursors";
 
 export type Caret = { page: number; top: number; left: number; height: number };
 
@@ -56,9 +62,20 @@ export function useCaretNavigation({
   /** Only keyboard-driven moves scroll the view. */
   const followRef = useRef(false);
   const lineCacheRef = useRef(new Map<number, PageLines>());
+  /**
+   * Cursor positions per line, keyed page:line:width. Building them measures
+   * every character and reads the page's pixels once, so each line is done
+   * once and reused until the page re-renders at another width.
+   */
+  const cursorCacheRef = useRef(new Map<string, LineCursors | null>());
+  // The selectionchange listener is installed once; these let it reach the
+  // current helpers without tearing it down and rebuilding it.
+  const lineCursorsRef = useRef<((page: number, line: number) => LineCursors | null) | null>(null);
+  const pageLinesRef = useRef<((page: number) => PageLines | null) | null>(null);
 
   useEffect(() => {
     lineCacheRef.current.clear();
+    cursorCacheRef.current.clear();
   }, [pageWidth]);
 
   /**
@@ -94,27 +111,6 @@ export function useCaretNavigation({
     }
   }, []);
 
-  /** Shows a caret where a click just collapsed the selection. */
-  const placeCaretFromClick = useCallback(
-    (pageNumber: number) => {
-      const host = pageRefs.current[pageNumber];
-      const sel = window.getSelection();
-      if (!host || !sel || sel.rangeCount === 0) return;
-      const r = sel.getRangeAt(0).getBoundingClientRect();
-      if (r.height <= 0) return;
-      const box = host.getBoundingClientRect();
-      setCaret({
-        page: pageNumber,
-        top: r.top - box.top,
-        left: r.left - box.left,
-        height: r.height,
-      });
-      caretModeRef.current = true;
-      preferredXRef.current = null;
-    },
-    [pageRefs],
-  );
-
   /** Cached line geometry for a page, rebuilt only when actually stale. */
   const getPageLines = useCallback(
     (pageNumber: number): PageLines | null => {
@@ -140,6 +136,90 @@ export function useCaretNavigation({
     },
     [pageRefs, pageWidth],
   );
+
+  /** Cursor positions for one line, built once and cached. */
+  const getLineCursors = useCallback(
+    (pageNumber: number, lineIndex: number): LineCursors | null => {
+      const host = pageRefs.current[pageNumber];
+      const page = getPageLines(pageNumber);
+      const line = page?.lines[lineIndex];
+      if (!host || !line) return null;
+      const key = `${pageNumber}:${lineIndex}:${pageWidth}`;
+      if (cursorCacheRef.current.has(key)) return cursorCacheRef.current.get(key) ?? null;
+      const built = buildLineCursors(host, line);
+      cursorCacheRef.current.set(key, built);
+      return built;
+    },
+    [getPageLines, pageRefs, pageWidth],
+  );
+
+  /** Which line of a page a DOM node belongs to, or -1. */
+  const lineOfNode = useCallback(
+    (pageNumber: number, node: Node): number => {
+      const page = getPageLines(pageNumber);
+      if (!page) return -1;
+      const element =
+        node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+      const span = element?.closest("span") as HTMLElement | null;
+      return span ? (page.bySpan.get(span) ?? -1) : -1;
+    },
+    [getPageLines],
+  );
+
+  /**
+   * Places the cursor for a click.
+   *
+   * The browser decides which line the click belongs to — it handles columns
+   * and wrapping correctly — and the cursor then goes to the nearest position
+   * on that line, chosen from the line's own character boundaries rather than
+   * from where the substitute font in the text layer thinks characters are.
+   * The DOM selection is moved to the very same boundary, so what is drawn and
+   * what a following Shift+Arrow extends from cannot disagree.
+   */
+  const placeCaretFromClick = useCallback(
+    (pageNumber: number, clientX: number) => {
+      const host = pageRefs.current[pageNumber];
+      const sel = window.getSelection();
+      if (!host || !sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      const rect = range.getBoundingClientRect();
+      if (rect.height <= 0) return;
+      const box = host.getBoundingClientRect();
+
+      const lineIndex = lineOfNode(pageNumber, range.startContainer);
+      const cursors = lineIndex >= 0 ? getLineCursors(pageNumber, lineIndex) : null;
+      caretModeRef.current = true;
+      preferredXRef.current = null;
+
+      if (!cursors || cursors.xs.length === 0) {
+        setCaret({
+          page: pageNumber,
+          top: rect.top - box.top,
+          left: rect.left - box.left,
+          height: rect.height,
+        });
+        return;
+      }
+
+      const index = nearestCursor(cursors, clientX - box.left);
+      setCaret({
+        page: pageNumber,
+        top: rect.top - box.top,
+        left: cursors.xs[index]!,
+        height: rect.height,
+      });
+      const collapsed = document.createRange();
+      collapsed.setStart(cursors.nodes[index]!, cursors.offsets[index]!);
+      collapsed.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(collapsed);
+    },
+    [getLineCursors, lineOfNode, pageRefs],
+  );
+
+  lineCursorsRef.current = getLineCursors;
+  pageLinesRef.current = getPageLines;
+
 
   const applySelection = useCallback((node: Text, offset: number, extend: boolean) => {
     const sel = window.getSelection();
@@ -307,10 +387,33 @@ export function useCaretNavigation({
       if (r.height === 0) r = range.getClientRects()[0] ?? r;
       if (r.height === 0) return; // nothing usable — keep the last position
       const box = host.getBoundingClientRect();
+      const pageNumber = Number(pageKey);
+
+      // Draw at the cursor position this selection *is*, looked up by DOM
+      // position rather than re-derived from coordinates. Whatever moved the
+      // selection — a click, an arrow key, the browser itself — the drawn
+      // cursor and the selection therefore always agree, so nothing can pull
+      // one back after the other has moved.
+      let left = r.left - box.left;
+      const page = pageLinesRef.current?.(pageNumber);
+      const element =
+        range.startContainer.nodeType === Node.ELEMENT_NODE
+          ? (range.startContainer as Element)
+          : range.startContainer.parentElement;
+      const span = element?.closest("span") as HTMLElement | null;
+      const lineIndex = span && page ? (page.bySpan.get(span) ?? -1) : -1;
+      if (lineIndex >= 0) {
+        const cursors = lineCursorsRef.current?.(pageNumber, lineIndex);
+        if (cursors) {
+          const index = cursorForSelection(cursors, range.startContainer, range.startOffset);
+          if (index >= 0) left = cursors.xs[index]!;
+        }
+      }
+
       setCaret({
-        page: Number(pageKey),
+        page: pageNumber,
         top: r.top - box.top,
-        left: r.left - box.left,
+        left,
         height: r.height,
       });
     }
@@ -389,5 +492,5 @@ export function useCaretNavigation({
     [],
   );
 
-  return { caret, caretModeRef, placeCaretFromClick, clearCaret };
+  return { caret, placeCaretFromClick, clearCaret };
 }

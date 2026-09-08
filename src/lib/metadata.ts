@@ -20,7 +20,8 @@ function stripTags(input: string) {
 
 function extract(xml: string, tag: string) {
   const m = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`));
-  return m ? stripTags(m[1]) : null;
+  const body = m?.[1];
+  return body === undefined ? null : stripTags(body);
 }
 
 function reconstructOpenAlexAbstract(invertedIndex?: Record<string, number[]> | null): string | null {
@@ -45,7 +46,7 @@ export function parseIdentifier(raw: string): { kind: "doi" | "arxiv" | "search"
     input.match(/arxiv\.org\/(?:abs|pdf)\/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?/i) ??
     input.match(/^arxiv:\s*([0-9]{4}\.[0-9]{4,5})/i) ??
     input.match(/^([0-9]{4}\.[0-9]{4,5})$/);
-  if (arxiv) return { kind: "arxiv", value: arxiv[1] };
+  if (arxiv?.[1]) return { kind: "arxiv", value: arxiv[1] };
 
   const doiMatch = input.match(/10\.\d{4,9}\/[-._;()/:A-Za-z0-9]+/i);
   if (doiMatch) {
@@ -330,7 +331,7 @@ async function lookupArxiv(arxivId: string): Promise<Lookup | null> {
       const entry = xml.split("<entry>")[1];
       if (!entry) continue;
 
-      const authors = [...entry.matchAll(/<name>([\s\S]*?)<\/name>/g)].map((m) => stripTags(m[1]));
+      const authors = [...entry.matchAll(/<name>([\s\S]*?)<\/name>/g)].map((m) => stripTags(m[1] ?? ""));
       const published = extract(entry, "published");
 
       return {

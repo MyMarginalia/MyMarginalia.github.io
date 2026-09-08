@@ -3,7 +3,6 @@ import type {
   AnnotationColor,
   CatalogPaper,
   LibraryItem,
-  PaperImportance,
   PaperInput,
   PaperStatus,
   Rect,
@@ -21,12 +20,6 @@ export type ProfileData = {
 
 type StoredPaper = LibraryItem;
 type StoredAnnotation = Annotation;
-
-interface MarginaliaDBSchema {
-  papers: StoredPaper;
-  annotations: StoredAnnotation;
-  settings: { key: string; value: unknown };
-}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 

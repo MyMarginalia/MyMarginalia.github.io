@@ -215,6 +215,18 @@ export function PdfReader({
   const renderDpr = Math.min(4, Math.max(1, Math.max(window.devicePixelRatio || 1, 2) / shownScale));
 
   const src = useMemo(() => ({ url }), [url]);
+  /**
+   * Lets pdf.js use the real metrics for the 14 standard PDF fonts instead of
+   * substituting a generic sans-serif. The invisible text layer is positioned
+   * from those metrics, so with a substitute the characters within a run drift
+   * from the glyphs painted underneath and a click lands the caret next to the
+   * character it was aimed at. Memoized because react-pdf reloads the document
+   * whenever this object's identity changes.
+   */
+  const documentOptions = useMemo(
+    () => ({ standardFontDataUrl: `${import.meta.env.BASE_URL}pdfjs/standard_fonts/` }),
+    [],
+  );
 
   useEffect(() => {
     const root = scrollRef.current;
@@ -328,7 +340,7 @@ export function PdfReader({
     setPage(current);
   }, []);
 
-  const { caret, caretModeRef, placeCaretFromClick, clearCaret } = useCaretNavigation({
+  const { caret, placeCaretFromClick, clearCaret } = useCaretNavigation({
     pageRefs,
     scrollRef,
     numPages,
@@ -412,7 +424,7 @@ export function PdfReader({
       if (!found) {
         setFocused(null);
         onSelectAnnotation?.(null);
-        placeCaretFromClick(n);
+        placeCaretFromClick(n, e.clientX);
         return;
       }
       clearCaret();
@@ -533,6 +545,12 @@ export function PdfReader({
         >
           <Document
             file={src}
+            options={documentOptions}
+            // Links out of a paper open in a new tab: following one in place
+            // would replace the reader, losing the page, zoom and scroll
+            // position with no way back but the browser's own history.
+            externalLinkTarget="_blank"
+            externalLinkRel="noopener noreferrer"
             onLoadSuccess={({ numPages: n }) => setNumPages(n)}
             onLoadError={() => setFailed(true)}
             onItemClick={({ dest, pageNumber }) => {

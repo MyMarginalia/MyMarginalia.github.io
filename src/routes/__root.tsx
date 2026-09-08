@@ -5,7 +5,6 @@ import {
   createRootRouteWithContext,
   useRouter,
 } from "@tanstack/react-router";
-import type { ReactNode } from "react";
 
 import { Toaster } from "@/components/ui/sonner";
 
