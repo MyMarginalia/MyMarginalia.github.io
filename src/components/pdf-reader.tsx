@@ -1,11 +1,20 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { Document, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import workerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { Loader2 } from "lucide-react";
 import { type Annotation, type AnnotationColor, type Rect } from "@/lib/paper-types";
-import { rectsContain, selectionToPageSelections } from "@/lib/pdf/highlight-rects";
+import { rectsContain, type PageSelection } from "@/lib/pdf/selection-geometry";
 import {
   NO_ANNOTATIONS,
   PdfPageView,
@@ -16,8 +25,8 @@ import {
   HIGHLIGHT_HEX,
   NewHighlightMenu,
 } from "@/components/reader/highlight-menu";
-import { ReaderToolbar, clampScale } from "@/components/reader/reader-toolbar";
-import { useCaretNavigation } from "@/components/reader/use-caret-navigation";
+import { ReaderToolbar, clampScale, nextZoomStop } from "@/components/reader/reader-toolbar";
+import { useTextSelection } from "@/components/reader/use-text-selection";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
 
@@ -26,15 +35,46 @@ export { HIGHLIGHT_HEX };
 /** Roughly how wide the menus are, for keeping them inside the page. */
 const MENU_WIDTH = 330;
 
-type Anchor = { page: number; top: number; left: number };
+/** The 100%-zoom page width: a comfortable reading size, never wider than the pane. */
+const MAX_READING_WIDTH = 920;
+
+/** Horizontal padding inside the scroll pane (px-4 on each side). */
+const PANE_PADDING = 32;
+
+/**
+ * Where a popup sits, as fractions of its page so it follows the page through
+ * zoom. `above` flips it over the line instead of under it when there is no
+ * room below inside the visible pane.
+ */
+type Anchor = { page: number; x: number; yTop: number; yBottom: number; above: boolean };
 
 type PendingSelection = {
-  groups: { page: number; quote: string; rects: Rect[] }[];
+  groups: PageSelection[];
   anchor: Anchor;
   quote: string;
 };
 
 type FocusedHighlight = { id: string; anchor: Anchor };
+
+/** Space a popup needs before it is moved above the line instead. */
+const MENU_ROOM = 220;
+
+function menuStyle(a: Anchor): CSSProperties {
+  // clamp() keeps the popup inside the page's right edge without measuring it.
+  const left = `clamp(0px, ${a.x * 100}%, calc(100% - ${MENU_WIDTH}px))`;
+  return a.above
+    ? { left, bottom: `calc(${(1 - a.yTop) * 100}% + 8px)` }
+    : { left, top: `calc(${a.yBottom * 100}% + 8px)` };
+}
+
+/**
+ * Pressing a popup button must not collapse the text selection or steal
+ * focus; the note field is the one place that should take both.
+ */
+function keepSelection(e: React.MouseEvent) {
+  if ((e.target as HTMLElement).closest("textarea, input")) return;
+  e.preventDefault();
+}
 
 /**
  * Reads a PDF destination array into a fraction of the way down its page.
@@ -76,6 +116,9 @@ export function PdfReader({
   activeId,
   onSelectAnnotation,
   jumpTo,
+  header,
+  actions,
+  storageKey,
 }: {
   url: string;
   annotations: Annotation[];
@@ -101,6 +144,12 @@ export function PdfReader({
    * asking for the same highlight twice a fresh request rather than a no-op.
    */
   jumpTo?: { id: string; nonce: number } | null;
+  /** Shown at the left of the toolbar (back link, title). */
+  header?: ReactNode;
+  /** Shown at the right of the toolbar. */
+  actions?: ReactNode;
+  /** When set, the reading position is saved here and restored on open. */
+  storageKey?: string;
 }) {
   const outerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -120,7 +169,6 @@ export function PdfReader({
   const [focused, setFocused] = useState<FocusedHighlight | null>(null);
   const [defaultColor, setDefaultColor] = useState<AnnotationColor>("yellow");
   const [busy, setBusy] = useState(false);
-  const [hoverPointer, setHoverPointer] = useState(false);
 
   // Pages render lazily and unmount again once well out of range; keeping the
   // whole document mounted was the main cause of the reader degrading the
@@ -160,30 +208,8 @@ export function PdfReader({
     return () => ro.disconnect();
   }, []);
 
-  // Height is measured rather than a fixed vh: at 80vh the reader plus the
-  // header, toolbar and footer added up to more than the window, so the page
-  // scrolled behind a pane that was itself scrolling — two scrollbars for one
-  // document. Filling the space actually left below the pane gives one.
-  const [paneHeight, setPaneHeight] = useState<number | null>(null);
-  useLayoutEffect(() => {
-    const measure = () => {
-      const el = scrollRef.current;
-      if (!el) return;
-      const top = el.getBoundingClientRect().top + window.scrollY;
-      // Fill the space left below the pane. Reserving the footer as well would
-      // cost about a hundred pixels of reading area to save a short scroll
-      // that only reveals the footer, so the footer is left below the fold and
-      // overscroll containment (see the pane's class) keeps a scroll inside
-      // the reader from spilling out to the page.
-      setPaneHeight(Math.max(360, Math.round(window.innerHeight - top - 24)));
-    };
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, [available]);
-
   // The pane reserves its own scrollbar width on platforms that don't overlay
-  // them, so the frame can hug the page instead of overflowing by that much.
+  // them, so the page width budget has to leave room for it.
   useEffect(() => {
     const outer = document.createElement("div");
     outer.style.cssText = "position:absolute;top:-9999px;width:100px;height:100px;overflow:scroll;";
@@ -195,20 +221,13 @@ export function PdfReader({
     document.body.removeChild(outer);
   }, []);
 
-  // The frame draws a 1px border on each side, and the pane reserves its own
-  // scrollbar where the platform doesn't overlay them. Both come out of the
-  // width budget; leaving the border out made every page 2px wider than the
-  // space it had, so the pane always had a stray horizontal scrollbar.
-  const FRAME_BORDER = 2;
-  const paneChrome = scrollbarWidth + FRAME_BORDER;
-  /** The 100%-zoom reading width; the frame is sized from this, not from zoom. */
-  const baseWidth = Math.max(280, Math.min(860, Math.floor(available - paneChrome)));
-  const pageWidth = Math.max(
-    140,
-    Math.floor(fitWidth ? Math.max(280, available - paneChrome) : baseWidth * scale),
-  );
-  const boxWidth = Math.min(available, (fitWidth ? pageWidth : baseWidth) + paneChrome);
+  /** Width available to a page once the pane's padding and scrollbar are out. */
+  const usable = Math.max(280, Math.floor(available - scrollbarWidth - PANE_PADDING));
+  const baseWidth = Math.min(MAX_READING_WIDTH, usable);
+  const pageWidth = Math.max(140, Math.floor(fitWidth ? usable : baseWidth * scale));
   const shownScale = pageWidth / baseWidth;
+  const shownScaleRef = useRef(shownScale);
+  shownScaleRef.current = shownScale;
   // Keep a roughly constant rasterized pixel budget regardless of zoom:
   // pageWidth already grows with zoom, so a flat devicePixelRatio on top of it
   // compounds into several times the pixel area for the same page.
@@ -263,50 +282,53 @@ export function PdfReader({
     setFocused(null);
   }, []);
 
-  const scrollToPage = useCallback((n: number, fraction = 0, center = false) => {
-    if (!pageRefs.current[n] || !scrollRef.current) return;
-    setVisiblePages((prev) => {
-      const next = new Set(prev);
-      next.add(n - 1);
-      next.add(n);
-      next.add(n + 1);
-      return next;
-    });
+  const scrollToPage = useCallback(
+    (n: number, fraction = 0, center = false, behavior: ScrollBehavior = "smooth") => {
+      if (!pageRefs.current[n] || !scrollRef.current) return;
+      setVisiblePages((prev) => {
+        const next = new Set(prev);
+        next.add(n - 1);
+        next.add(n);
+        next.add(n + 1);
+        return next;
+      });
 
-    const run = (behavior: ScrollBehavior) => {
-      const el = pageRefs.current[n];
-      const container = scrollRef.current;
-      if (!el || !container) return;
-      const targetY = el.offsetTop - container.offsetTop + fraction * el.offsetHeight;
-      const top = center ? targetY - container.clientHeight / 2 : targetY - 8;
-      if (Math.abs(container.scrollTop - top) < 2) return;
-      container.scrollTo({ top, behavior });
-    };
-
-    // Measure only once the pages just marked visible have mounted: an offset
-    // computed against the pre-mount layout aims at a position that stops
-    // meaning the same thing once they render.
-    requestAnimationFrame(() => {
-      run("smooth");
-      // A page finishing later can still nudge the layout, so keep checking
-      // briefly and correct only while the scroll is at rest — never fighting
-      // the animation or a deliberate scroll. Each check is a no-op on target.
-      if (scrollSettleTimer.current !== undefined) window.clearInterval(scrollSettleTimer.current);
-      let previousTop = -1;
-      let ticks = 0;
-      scrollSettleTimer.current = window.setInterval(() => {
+      const run = (behavior: ScrollBehavior) => {
+        const el = pageRefs.current[n];
         const container = scrollRef.current;
-        ticks += 1;
-        if (!container || ticks > 12) {
-          window.clearInterval(scrollSettleTimer.current);
-          scrollSettleTimer.current = undefined;
-          return;
-        }
-        if (container.scrollTop === previousTop) run("auto");
-        previousTop = container.scrollTop;
-      }, 200);
-    });
-  }, []);
+        if (!el || !container) return;
+        const targetY = el.offsetTop - container.offsetTop + fraction * el.offsetHeight;
+        const top = center ? targetY - container.clientHeight / 2 : targetY - 8;
+        if (Math.abs(container.scrollTop - top) < 2) return;
+        container.scrollTo({ top, behavior });
+      };
+
+      // Measure only once the pages just marked visible have mounted: an offset
+      // computed against the pre-mount layout aims at a position that stops
+      // meaning the same thing once they render.
+      requestAnimationFrame(() => {
+        run(behavior);
+        // A page finishing later can still nudge the layout, so keep checking
+        // briefly and correct only while the scroll is at rest — never fighting
+        // the animation or a deliberate scroll. Each check is a no-op on target.
+        if (scrollSettleTimer.current !== undefined) window.clearInterval(scrollSettleTimer.current);
+        let previousTop = -1;
+        let ticks = 0;
+        scrollSettleTimer.current = window.setInterval(() => {
+          const container = scrollRef.current;
+          ticks += 1;
+          if (!container || ticks > 12) {
+            window.clearInterval(scrollSettleTimer.current);
+            scrollSettleTimer.current = undefined;
+            return;
+          }
+          if (container.scrollTop === previousTop) run("auto");
+          previousTop = container.scrollTop;
+        }, 200);
+      });
+    },
+    [],
+  );
 
   useEffect(
     () => () => {
@@ -327,10 +349,25 @@ export function PdfReader({
     [numPages, scrollToPage],
   );
 
+  const storageKeyRef = useRef(storageKey);
+  storageKeyRef.current = storageKey;
+  const saveTimer = useRef<number | undefined>(undefined);
+  /**
+   * Where the viewport sits as a fraction of the scrollable content. Page
+   * heights scale with zoom, so restoring the same fractions after a zoom or
+   * resize keeps the reader on the passage they were reading instead of
+   * leaving scrollTop at a pixel offset that now means somewhere else.
+   */
+  const anchorRef = useRef({ y: 0, x: 0.5 });
+
   /** Tracks which page is mostly in view so the toolbar counter stays right. */
   const onScroll = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return;
+    anchorRef.current = {
+      y: container.scrollTop / Math.max(1, container.scrollHeight),
+      x: (container.scrollLeft + container.clientWidth / 2) / Math.max(1, container.scrollWidth),
+    };
     const mid = container.scrollTop + container.clientHeight / 3;
     let current = 1;
     for (const [key, el] of Object.entries(pageRefs.current)) {
@@ -338,80 +375,193 @@ export function PdfReader({
       if (el.offsetTop - container.offsetTop <= mid) current = Number(key);
     }
     setPage(current);
+
+    if (!storageKeyRef.current) return;
+    window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => {
+      const key = storageKeyRef.current;
+      const host = pageRefs.current[current];
+      const pane = scrollRef.current;
+      if (!key || !host || !pane) return;
+      const fraction = (pane.scrollTop - (host.offsetTop - pane.offsetTop)) / Math.max(1, host.offsetHeight);
+      try {
+        localStorage.setItem(
+          key,
+          JSON.stringify({ page: current, fraction: Math.min(1, Math.max(0, fraction)) }),
+        );
+      } catch {
+        /* storage unavailable: losing the position is fine */
+      }
+    }, 400);
   }, []);
 
-  const { caret, placeCaretFromClick, clearCaret } = useCaretNavigation({
-    pageRefs,
-    scrollRef,
-    numPages,
-    pageWidth,
-    setVisiblePages,
-    onPageStep: stepPage,
-    onEscape: dismiss,
-  });
+  useEffect(() => () => window.clearTimeout(saveTimer.current), []);
+
+  // Zoom and resize change every page's height; put the viewport back on the
+  // same part of the document.
+  useLayoutEffect(() => {
+    const pane = scrollRef.current;
+    if (!pane || anchorRef.current.y <= 0) return;
+    pane.scrollTop = anchorRef.current.y * pane.scrollHeight;
+    pane.scrollLeft = anchorRef.current.x * pane.scrollWidth - pane.clientWidth / 2;
+  }, [pageWidth]);
+
+  // Reopen where the reader left off.
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (!storageKey || numPages === 0 || restoredRef.current) return;
+    restoredRef.current = true;
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey) ?? "null") as {
+        page?: number;
+        fraction?: number;
+      } | null;
+      if (saved?.page && (saved.page > 1 || (saved.fraction ?? 0) > 0.02)) {
+        scrollToPage(Math.min(saved.page, numPages), saved.fraction ?? 0, false, "auto");
+      }
+    } catch {
+      /* unreadable saved position: start at the top */
+    }
+  }, [numPages, scrollToPage, storageKey]);
+
+  const zoomStep = useCallback((dir: 1 | -1) => {
+    setFitWidth(false);
+    setScale(clampScale(nextZoomStop(shownScaleRef.current, dir)));
+  }, []);
+
+  // Ctrl/Cmd + wheel, and trackpad pinch (which browsers report the same way),
+  // zoom the document rather than the whole browser page. Applied in short
+  // batches because each zoom re-rasterizes the visible pages.
+  useEffect(() => {
+    const pane = scrollRef.current;
+    if (!pane) return;
+    let pending = 1;
+    let timer: number | undefined;
+    const flush = () => {
+      timer = undefined;
+      const factor = pending;
+      pending = 1;
+      setFitWidth(false);
+      setScale(clampScale(shownScaleRef.current * factor));
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      pending *= Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025));
+      timer ??= window.setTimeout(flush, 70);
+    };
+    pane.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      pane.removeEventListener("wheel", onWheel);
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  // + / - / 0 to zoom, unless the person is typing in a field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (e.key === "+" || e.key === "=") zoomStep(1);
+      else if (e.key === "-") zoomStep(-1);
+      else if (e.key === "0") {
+        setFitWidth(false);
+        setScale(1);
+      } else return;
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoomStep]);
 
   const handlePageLoadSuccess = useCallback((p: PageLoadInfo) => {
     setPageAspect((prev) => prev ?? p.width / p.height);
     setPagePointsHeight((prev) => prev ?? p.originalHeight);
   }, []);
 
-  /** Turns whatever is selected into per-page highlight groups. */
-  const captureSelection = useCallback(() => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
-      setPending(null);
-      return;
-    }
-    const groups = selectionToPageSelections(sel, pageRefs.current).filter(
-      (g) => g.rects.length > 0 && g.quote,
-    );
-    if (groups.length === 0) {
-      setPending(null);
-      return;
-    }
-    clearCaret();
-    setFocused(null);
+  /** Places a popup under the last line of `rects` on page `n`, or above it near the pane's foot. */
+  const anchorFor = useCallback((n: number, rects: Rect[]): Anchor | null => {
+    const host = pageRefs.current[n];
+    const pane = scrollRef.current;
+    const last = rects[rects.length - 1];
+    if (!host || !pane || !last) return null;
+    const hostBox = host.getBoundingClientRect();
+    const paneBox = pane.getBoundingClientRect();
+    const lineTop = hostBox.top + last.y * hostBox.height;
+    const lineBottom = hostBox.top + (last.y + last.h) * hostBox.height;
+    const roomBelow = paneBox.bottom - lineBottom;
+    const roomAbove = lineTop - paneBox.top;
+    return {
+      page: n,
+      x: last.x,
+      yTop: last.y,
+      yBottom: last.y + last.h,
+      above: roomBelow < MENU_ROOM && roomAbove > roomBelow,
+    };
+  }, []);
 
-    // Anchor the menu under the end of the selection, on the page it ends on.
-    const last = groups[groups.length - 1]!;
-    const host = pageRefs.current[last.page];
-    const lastRect = last.rects[last.rects.length - 1]!;
-    const width = host?.clientWidth ?? pageWidth;
-    const height = host?.clientHeight ?? 0;
-    setPending({
-      groups,
-      quote: groups.map((g) => g.quote).join(" "),
-      anchor: {
-        page: last.page,
-        top: (lastRect.y + lastRect.h) * height + 8,
-        left: Math.max(0, Math.min(lastRect.x * width, width - MENU_WIDTH)),
-      },
-    });
-  }, [clearCaret, pageWidth]);
+  // A finished selection opens the highlight popup; a new press or Escape
+  // closes it. See useTextSelection for what "finished" means.
+  const handleSelect = useCallback(
+    (groups: PageSelection[]) => {
+      const last = groups[groups.length - 1];
+      if (!last) return;
+      const anchor = anchorFor(last.page, last.rects);
+      if (!anchor) return;
+      setFocused(null);
+      setPending({ groups, anchor, quote: groups.map((g) => g.quote).join(" ") });
+    },
+    [anchorFor],
+  );
+  useTextSelection({
+    paneRef: scrollRef,
+    pageRefs,
+    onSelect: handleSelect,
+    onDismiss: dismiss,
+  });
 
-  // A selection built with Shift+Arrow ends with a key release, not a mouse
-  // release, so without this the highlight menu never appeared for one and
-  // keyboard-selected text could not be highlighted at all.
+  // Left/Right and PageUp/PageDown turn pages; everything else is left to the
+  // browser, so arrow keys scroll the pane and Shift+Arrow selects as usual.
   useEffect(() => {
-    function onKeyUp(e: KeyboardEvent) {
-      if (e.key !== "Shift") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
       const sel = window.getSelection();
-      if (sel && !sel.isCollapsed) captureSelection();
-    }
-    window.addEventListener("keyup", onKeyUp);
-    return () => window.removeEventListener("keyup", onKeyUp);
-  }, [captureSelection]);
+      if (sel && !sel.isCollapsed) return;
+      if (e.key === "ArrowRight" || e.key === "PageDown") {
+        e.preventDefault();
+        stepPage(1);
+      } else if (e.key === "ArrowLeft" || e.key === "PageUp") {
+        e.preventDefault();
+        stepPage(-1);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [stepPage]);
 
+  // Focus the pane once there is a document, so arrow keys scroll it straight away.
+  const loaded = numPages > 0;
+  useEffect(() => {
+    if (loaded) scrollRef.current?.focus({ preventScroll: true });
+  }, [loaded]);
+
+  /** The highlight under a pointer, newest first so the latest of two overlapping ones wins. */
   const hitAnnotation = useCallback(
-    (e: { clientX: number; clientY: number }, n: number) => {
+    (e: { clientX: number; clientY: number }, n: number): Annotation | null => {
       const host = pageRefs.current[n];
-      if (!host) return null;
+      const onPage = annotationsByPage.get(n);
+      if (!host || !onPage) return null;
       const box = host.getBoundingClientRect();
       const px = (e.clientX - box.left) / box.width;
       const py = (e.clientY - box.top) / box.height;
-      const onPage = annotationsByPage.get(n);
-      const hit = onPage?.find((a) => rectsContain(a.rects, px, py));
-      return hit ? { hit, box } : null;
+      for (let i = onPage.length - 1; i >= 0; i--) {
+        const a = onPage[i]!;
+        if (rectsContain(a.rects, px, py)) return a;
+      }
+      return null;
     },
     [annotationsByPage],
   );
@@ -419,29 +569,19 @@ export function PdfReader({
   const handlePageClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>, n: number) => {
       const sel = window.getSelection();
-      if (sel && !sel.isCollapsed) return; // a drag just made a selection
-      const found = hitAnnotation(e, n);
-      if (!found) {
-        setFocused(null);
+      if (sel && !sel.isCollapsed) return; // this click ended a drag-selection
+      const hit = hitAnnotation(e, n);
+      if (!hit) {
         onSelectAnnotation?.(null);
-        placeCaretFromClick(n, e.clientX);
         return;
       }
-      clearCaret();
+      const anchor = anchorFor(n, hit.rects);
+      if (!anchor) return;
       setPending(null);
-      const { hit, box } = found;
-      const lastRect = hit.rects[hit.rects.length - 1]!;
       onSelectAnnotation?.(hit.id);
-      setFocused({
-        id: hit.id,
-        anchor: {
-          page: n,
-          top: (lastRect.y + lastRect.h) * box.height + 8,
-          left: Math.max(0, Math.min(lastRect.x * box.width, box.width - MENU_WIDTH)),
-        },
-      });
+      setFocused({ id: hit.id, anchor });
     },
-    [clearCaret, hitAnnotation, onSelectAnnotation, placeCaretFromClick],
+    [anchorFor, hitAnnotation, onSelectAnnotation],
   );
 
   // Scrolls a highlight into view when the sidebar asks for it.
@@ -500,12 +640,16 @@ export function PdfReader({
 
   if (failed) {
     return (
-      <div className="space-y-3">
-        <p className="rounded-md border border-border bg-card p-3 text-sm text-muted-foreground">
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-card px-3">
+          <div className="flex min-w-0 flex-1 items-center">{header}</div>
+          <div className="flex items-center gap-1">{actions}</div>
+        </div>
+        <p className="border-b border-border bg-card px-3 py-2 text-sm text-muted-foreground">
           This PDF could not be loaded for in-page highlighting (the host blocks it). It is shown
           below as a plain document.
         </p>
-        <iframe title="PDF" src={url} className="h-[75vh] w-full rounded-md border border-border" />
+        <iframe title="PDF" src={url} className="min-h-0 w-full flex-1 border-0 bg-white" />
       </div>
     );
   }
@@ -514,137 +658,135 @@ export function PdfReader({
   const placeholderHeight = pageAspect ? pageWidth / pageAspect : pageWidth * 1.3;
 
   return (
-    <div ref={outerRef} className="w-full">
+    <div ref={outerRef} className="flex h-full min-h-0 w-full flex-col bg-background">
+      <ReaderToolbar
+        page={page}
+        numPages={numPages}
+        scale={shownScale}
+        fitWidth={fitWidth}
+        onGoToPage={(n) => scrollToPage(n)}
+        onStepPage={stepPage}
+        onSetScale={(next) => {
+          setFitWidth(false);
+          setScale(clampScale(next));
+        }}
+        onFitWidth={() => setFitWidth((v) => !v)}
+        header={header}
+        actions={actions}
+      />
+
       <div
-        style={{ width: boxWidth }}
-        className="mx-auto overflow-hidden rounded-md border border-border bg-card"
+        ref={scrollRef}
+        onScroll={onScroll}
+        tabIndex={0}
+        className="pdf-scroll-pane min-h-0 flex-1 overscroll-contain overflow-auto bg-muted outline-none"
+        // Pages mount and unmount as they scroll in and out of range, and the
+        // browser's scroll anchoring reacts by silently adjusting scrollTop,
+        // which fights deliberate scrolls. Placeholders already hold each
+        // page's exact height, so there is nothing to anchor against.
+        style={{ overflowAnchor: "none" }}
       >
-        <ReaderToolbar
-          page={page}
-          numPages={numPages}
-          scale={shownScale}
-          fitWidth={fitWidth}
-          onGoToPage={(n) => scrollToPage(n)}
-          onStepPage={stepPage}
-          onSetScale={(next) => {
-            setFitWidth(false);
-            setScale(clampScale(next));
+        <Document
+          file={src}
+          options={documentOptions}
+          // Links out of a paper open in a new tab: following one in place
+          // would replace the reader, losing the page, zoom and scroll
+          // position with no way back but the browser's own history.
+          externalLinkTarget="_blank"
+          externalLinkRel="noopener noreferrer"
+          onLoadSuccess={({ numPages: n }) => setNumPages(n)}
+          onLoadError={() => setFailed(true)}
+          onItemClick={({ dest, pageNumber }) => {
+            dismiss();
+            scrollToPage(pageNumber, destTopFraction(dest, pagePointsHeightRef.current), true);
           }}
-          onFitWidth={() => setFitWidth((v) => !v)}
-        />
-
-        <div
-          ref={scrollRef}
-          onScroll={onScroll}
-          className="pdf-scroll-pane overscroll-contain overflow-auto bg-muted/30"
-          // Pages mount and unmount as they scroll in and out of range, and the
-          // browser's scroll anchoring reacts by silently adjusting scrollTop,
-          // which fights deliberate scrolls. Placeholders already hold each
-          // page's exact height, so there is nothing to anchor against.
-          style={{ overflowAnchor: "none", height: paneHeight ?? undefined }}
-        >
-          <Document
-            file={src}
-            options={documentOptions}
-            // Links out of a paper open in a new tab: following one in place
-            // would replace the reader, losing the page, zoom and scroll
-            // position with no way back but the browser's own history.
-            externalLinkTarget="_blank"
-            externalLinkRel="noopener noreferrer"
-            onLoadSuccess={({ numPages: n }) => setNumPages(n)}
-            onLoadError={() => setFailed(true)}
-            onItemClick={({ dest, pageNumber }) => {
-              // Following a link moves the reader elsewhere, so a caret left
-              // behind at the link is no longer meaningful.
-              clearCaret();
-              dismiss();
-              scrollToPage(pageNumber, destTopFraction(dest, pagePointsHeightRef.current), true);
-            }}
-            loading={
-              <div className="flex items-center gap-2 p-8 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" /> Loading PDF…
-              </div>
-            }
-            error={<p className="p-8 text-sm text-muted-foreground">Could not load this PDF.</p>}
-          >
-            <div className="flex flex-col items-center gap-4">
-              {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => (
-                <div
-                  key={n}
-                  data-page={n}
-                  ref={(el) => {
-                    pageRefs.current[n] = el;
-                    if (el) observerRef.current?.observe(el);
-                  }}
-                  className="pdf-page relative w-fit shadow-sm"
-                  onMouseUp={captureSelection}
-                  onTouchEnd={captureSelection}
-                  onClick={(e) => handlePageClick(e, n)}
-                  onMouseMove={(e) => {
-                    const sel = window.getSelection();
-                    if (sel && !sel.isCollapsed) return;
-                    setHoverPointer(hitAnnotation(e, n) !== null);
-                  }}
-                  onMouseLeave={() => setHoverPointer(false)}
-                  style={{ cursor: hoverPointer ? "pointer" : undefined }}
-                >
-                  <PdfPageView
-                    pageNumber={n}
-                    isVisible={visiblePages.has(n)}
-                    pageWidth={pageWidth}
-                    placeholderHeight={placeholderHeight}
-                    renderDpr={renderDpr}
-                    onLoadSuccess={handlePageLoadSuccess}
-                    annotations={annotationsByPage.get(n) ?? NO_ANNOTATIONS}
-                    activeId={activeId}
-                    caret={caret && caret.page === n ? caret : null}
-                  />
-
-                  {pending && pending.anchor.page === n && (
-                    <div
-                      className="absolute z-20"
-                      style={{ top: pending.anchor.top, left: pending.anchor.left }}
-                      onMouseUp={(e) => e.stopPropagation()}
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <NewHighlightMenu
-                        quote={pending.quote}
-                        defaultColor={defaultColor}
-                        busy={busy}
-                        onHighlight={(color, comment) => void createHighlight(color, comment)}
-                        onDismiss={() => {
-                          window.getSelection()?.removeAllRanges();
-                          dismiss();
-                        }}
-                      />
-                    </div>
-                  )}
-
-                  {focused && focusedAnnotation && focused.anchor.page === n && (
-                    <div
-                      className="absolute z-20"
-                      style={{ top: focused.anchor.top, left: focused.anchor.left }}
-                      onMouseUp={(e) => e.stopPropagation()}
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <EditHighlightMenu
-                        quote={focusedAnnotation.quote}
-                        comment={focusedAnnotation.comment}
-                        color={focusedAnnotation.color}
-                        busy={busy}
-                        onRecolor={(c) => void patchFocused({ color: c })}
-                        onSaveComment={(text) => void patchFocused({ comment: text || null })}
-                        onDeleteComment={() => void patchFocused({ comment: null })}
-                        onDelete={() => void deleteFocused()}
-                        onDismiss={dismiss}
-                      />
-                    </div>
-                  )}
-                </div>
-              ))}
+          loading={
+            <div className="flex items-center gap-2 p-8 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading PDF…
             </div>
-          </Document>
-        </div>
+          }
+          error={<p className="p-8 text-sm text-muted-foreground">Could not load this PDF.</p>}
+        >
+          {/* w-fit + min-w-full: when a zoomed page is wider than the pane the
+              column grows with it, so the page stays fully scrollable. A
+              plain centred column overflows equally on both sides and the
+              left edge becomes unreachable. */}
+          <div className="flex w-fit min-w-full flex-col items-center gap-3 px-4 py-4">
+            {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => (
+              <div
+                key={n}
+                data-page={n}
+                ref={(el) => {
+                  pageRefs.current[n] = el;
+                  if (el) observerRef.current?.observe(el);
+                }}
+                className="pdf-page relative w-fit shadow-[0_1px_3px_rgba(0,0,0,0.2),0_6px_20px_rgba(0,0,0,0.12)]"
+                onClick={(e) => handlePageClick(e, n)}
+                onMouseMove={(e) => {
+                  const sel = window.getSelection();
+                  if (sel && !sel.isCollapsed) return;
+                  // Toggled on the element directly: a hover shouldn't re-render the reader.
+                  e.currentTarget.classList.toggle("is-over-highlight", hitAnnotation(e, n) !== null);
+                }}
+                onMouseLeave={(e) => e.currentTarget.classList.remove("is-over-highlight")}
+              >
+                <PdfPageView
+                  pageNumber={n}
+                  isVisible={visiblePages.has(n)}
+                  pageWidth={pageWidth}
+                  placeholderHeight={placeholderHeight}
+                  renderDpr={renderDpr}
+                  onLoadSuccess={handlePageLoadSuccess}
+                  annotations={annotationsByPage.get(n) ?? NO_ANNOTATIONS}
+                  activeId={activeId}
+                />
+
+                {pending && pending.anchor.page === n && (
+                  <div
+                    data-highlight-menu=""
+                    className="absolute z-20"
+                    style={menuStyle(pending.anchor)}
+                    onMouseDown={keepSelection}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <NewHighlightMenu
+                      quote={pending.quote}
+                      defaultColor={defaultColor}
+                      busy={busy}
+                      onHighlight={(color, comment) => void createHighlight(color, comment)}
+                      onDismiss={() => {
+                        window.getSelection()?.removeAllRanges();
+                        dismiss();
+                      }}
+                    />
+                  </div>
+                )}
+
+                {focused && focusedAnnotation && focused.anchor.page === n && (
+                  <div
+                    data-highlight-menu=""
+                    className="absolute z-20"
+                    style={menuStyle(focused.anchor)}
+                    onMouseDown={keepSelection}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <EditHighlightMenu
+                      quote={focusedAnnotation.quote}
+                      comment={focusedAnnotation.comment}
+                      color={focusedAnnotation.color}
+                      busy={busy}
+                      onRecolor={(c) => void patchFocused({ color: c })}
+                      onSaveComment={(text) => void patchFocused({ comment: text || null })}
+                      onDeleteComment={() => void patchFocused({ comment: null })}
+                      onDelete={() => void deleteFocused()}
+                      onDismiss={dismiss}
+                    />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </Document>
       </div>
     </div>
   );

@@ -236,7 +236,10 @@
   position: absolute;
   inset: 0;
   pointer-events: none;
-  z-index: 1;
+  /* No z-index on purpose: that would make the layer its own stacking context,
+     and the multiply blend below could then only blend with the layer itself
+     rather than with the page underneath. The text layer's z-index: 2 is what
+     keeps text above the highlights. */
 }
 
 /* Blending and opacity belong to the group, not to each rect. A letter
@@ -289,18 +292,10 @@
   color: transparent;
 }
 
-/* Fake text caret — plain selectable (non-editable) text never gets a real
-   blinking cursor from the browser, so a click fakes one for visual feedback. */
-.pdf-caret {
-  position: absolute;
-  width: 1px;
-  pointer-events: none;
-  background: var(--color-primary);
-  z-index: 3;
-  animation: pdf-caret-blink 1s step-end infinite;
-}
-
-@keyframes pdf-caret-blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
+/* Pointer over a highlight: pdf.js gives every text span its own I-beam
+   cursor, which a cursor set on the page would never beat. */
+.pdf-page.is-over-highlight,
+.pdf-page.is-over-highlight .textLayer,
+.pdf-page.is-over-highlight .textLayer :is(span, br) {
+  cursor: pointer;
 }

@@ -4,7 +4,6 @@ import { Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Annotation } from "@/lib/paper-types";
 import { HIGHLIGHT_ALPHA, HIGHLIGHT_HEX } from "@/components/reader/highlight-menu";
-import type { Caret } from "@/components/reader/use-caret-navigation";
 
 // react-pdf's own Page isn't memoized, so it — and its text and annotation
 // layers, which together own on the order of a thousand DOM nodes per page —
@@ -18,10 +17,10 @@ export const NO_ANNOTATIONS: Annotation[] = [];
 export type PageLoadInfo = { width: number; height: number; originalHeight: number };
 
 /**
- * One page: canvas, text layer, highlights and caret.
+ * One page: canvas, text layer and highlights.
  *
  * Everything expensive per page lives here rather than inline in the reader,
- * so that a caret move or a hover — which only ever affect one page — don't
+ * so that a hover or a new highlight — which only ever affect one page — don't
  * re-run the JSX for every page in the document.
  */
 export const PdfPageView = memo(function PdfPageView({
@@ -33,7 +32,6 @@ export const PdfPageView = memo(function PdfPageView({
   onLoadSuccess,
   annotations,
   activeId,
-  caret,
 }: {
   pageNumber: number;
   isVisible: boolean;
@@ -43,7 +41,6 @@ export const PdfPageView = memo(function PdfPageView({
   onLoadSuccess: (page: PageLoadInfo) => void;
   annotations: Annotation[];
   activeId?: string | null;
-  caret: Caret | null;
 }) {
   // Identical footprint whether the page is unmounted, mounting or rendered.
   // react-pdf's default loading state is a line of text a few pixels tall, so
@@ -52,10 +49,10 @@ export const PdfPageView = memo(function PdfPageView({
   // which threw scroll positions off and made scrolling visibly jumpy.
   const placeholder = (
     <div
-      className="flex items-center justify-center bg-card"
+      className="flex items-center justify-center bg-white"
       style={{ width: pageWidth, height: placeholderHeight }}
     >
-      <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      <Loader2 className="h-5 w-5 animate-spin text-neutral-400" />
     </div>
   );
 
@@ -74,13 +71,6 @@ export const PdfPageView = memo(function PdfPageView({
         />
       ) : (
         placeholder
-      )}
-
-      {caret && (
-        <span
-          className="pdf-caret"
-          style={{ top: caret.top, left: caret.left, height: caret.height }}
-        />
       )}
 
       <div className="pdf-highlight-layer">
