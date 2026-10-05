@@ -13,8 +13,15 @@ import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import workerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { Loader2 } from "lucide-react";
-import { type Annotation, type AnnotationColor, type Rect } from "@/lib/paper-types";
+import { toast } from "sonner";
+import {
+  ANNOTATION_COLORS,
+  type Annotation,
+  type AnnotationColor,
+  type Rect,
+} from "@/lib/paper-types";
 import { rectsContain, type PageSelection } from "@/lib/pdf/selection-geometry";
+import { toolCursor } from "@/lib/pdf/tool-cursors";
 import {
   NO_ANNOTATIONS,
   PdfPageView,
@@ -25,7 +32,13 @@ import {
   HIGHLIGHT_HEX,
   NewHighlightMenu,
 } from "@/components/reader/highlight-menu";
-import { ReaderToolbar, clampScale, nextZoomStop } from "@/components/reader/reader-toolbar";
+import {
+  HighlightTools,
+  ReaderToolbar,
+  clampScale,
+  nextZoomStop,
+  type ReaderTool,
+} from "@/components/reader/reader-toolbar";
 import { useTextSelection } from "@/components/reader/use-text-selection";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
@@ -52,6 +65,8 @@ type PendingSelection = {
   groups: PageSelection[];
   anchor: Anchor;
   quote: string;
+  /** Open straight into the note field. */
+  note: boolean;
 };
 
 type FocusedHighlight = { id: string; anchor: Anchor };
@@ -168,6 +183,12 @@ export function PdfReader({
   const [pending, setPending] = useState<PendingSelection | null>(null);
   const [focused, setFocused] = useState<FocusedHighlight | null>(null);
   const [defaultColor, setDefaultColor] = useState<AnnotationColor>("yellow");
+  const [tool, setTool] = useState<ReaderTool>(null);
+  // Highlighter or note cursor, tinted with the armed colour.
+  const toolCursorValue = useMemo(
+    () => (tool ? toolCursor(tool, HIGHLIGHT_HEX[defaultColor]) : undefined),
+    [tool, defaultColor],
+  );
   const [busy, setBusy] = useState(false);
 
   // Pages render lazily and unmount again once well out of range; keeping the
@@ -501,25 +522,99 @@ export function PdfReader({
     };
   }, []);
 
-  // A finished selection opens the highlight popup; a new press or Escape
-  // closes it. See useTextSelection for what "finished" means.
-  const handleSelect = useCallback(
-    (groups: PageSelection[]) => {
+  /** Saves highlights at once, with no popup. The selection goes first so nothing re-captures it. */
+  const saveHighlight = useCallback(
+    async (groups: PageSelection[], color: AnnotationColor) => {
+      window.getSelection()?.removeAllRanges();
+      try {
+        await onCreate({ groups, color, comment: null });
+        setDefaultColor(color);
+      } catch {
+        toast.error("Couldn't save that highlight.");
+      }
+    },
+    [onCreate],
+  );
+
+  /** Opens the highlight popup under the last line of a selection. */
+  const openPopup = useCallback(
+    (groups: PageSelection[], note: boolean) => {
       const last = groups[groups.length - 1];
       if (!last) return;
       const anchor = anchorFor(last.page, last.rects);
       if (!anchor) return;
       setFocused(null);
-      setPending({ groups, anchor, quote: groups.map((g) => g.quote).join(" ") });
+      setPending({ groups, anchor, quote: groups.map((g) => g.quote).join(" "), note });
     },
     [anchorFor],
   );
-  useTextSelection({
+
+  // A finished selection does whatever the toolbar's tool says: highlight it
+  // outright, open the note field, or (no tool) offer the popup. A new press or
+  // Escape closes the popup. See useTextSelection for what "finished" means.
+  const handleSelect = useCallback(
+    (groups: PageSelection[]) => {
+      if (tool === "highlight") void saveHighlight(groups, defaultColor);
+      else openPopup(groups, tool === "note");
+    },
+    [defaultColor, openPopup, saveHighlight, tool],
+  );
+  const { readSelection } = useTextSelection({
     paneRef: scrollRef,
     pageRefs,
     onSelect: handleSelect,
     onDismiss: dismiss,
+    instant: tool === "highlight",
   });
+
+  const defaultColorRef = useRef(defaultColor);
+  defaultColorRef.current = defaultColor;
+
+  /** A toolbar colour: applies to selected text if there is any, otherwise arms (or disarms) the highlighter. */
+  const pickColor = useCallback(
+    (color: AnnotationColor) => {
+      const selected = readSelection();
+      if (selected.length > 0) {
+        void saveHighlight(selected, color);
+        return;
+      }
+      setDefaultColor(color);
+      setTool((t) => (t === "highlight" && defaultColorRef.current === color ? null : "highlight"));
+    },
+    [readSelection, saveHighlight],
+  );
+
+  const toggleNote = useCallback(() => {
+    const selected = readSelection();
+    if (selected.length > 0) {
+      openPopup(selected, true);
+      return;
+    }
+    setTool((t) => (t === "note" ? null : "note"));
+  }, [openPopup, readSelection]);
+
+  // 1-5 pick a colour, N arms the note tool, Escape closes a popup and then
+  // the tool. (The popup half of Escape is handled in useTextSelection.)
+  const popupOpenRef = useRef(false);
+  popupOpenRef.current = pending !== null || focused !== null;
+  const shortcutsRef = useRef({ pickColor, toggleNote });
+  shortcutsRef.current = { pickColor, toggleNote };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
+      const index = Number(e.key) - 1;
+      const color = Number.isInteger(index) ? ANNOTATION_COLORS[index] : undefined;
+      if (color) shortcutsRef.current.pickColor(color);
+      else if (e.key === "n" || e.key === "N") shortcutsRef.current.toggleNote();
+      else if (e.key === "Escape" && !popupOpenRef.current) setTool(null);
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Left/Right and PageUp/PageDown turn pages; everything else is left to the
   // browser, so arrow keys scroll the pane and Shift+Arrow selects as usual.
@@ -672,6 +767,14 @@ export function PdfReader({
         }}
         onFitWidth={() => setFitWidth((v) => !v)}
         header={header}
+        tools={
+          <HighlightTools
+            tool={tool}
+            color={defaultColor}
+            onPickColor={pickColor}
+            onToggleNote={toggleNote}
+          />
+        }
         actions={actions}
       />
 
@@ -679,12 +782,20 @@ export function PdfReader({
         ref={scrollRef}
         onScroll={onScroll}
         tabIndex={0}
+        data-tool={tool ?? undefined}
         className="pdf-scroll-pane min-h-0 flex-1 overscroll-contain overflow-auto bg-muted outline-none"
         // Pages mount and unmount as they scroll in and out of range, and the
         // browser's scroll anchoring reacts by silently adjusting scrollTop,
         // which fights deliberate scrolls. Placeholders already hold each
         // page's exact height, so there is nothing to anchor against.
-        style={{ overflowAnchor: "none" }}
+        style={
+          {
+            overflowAnchor: "none",
+            // While a colour is armed, the drag selection previews that colour.
+            "--selection-colour": tool ? HIGHLIGHT_HEX[defaultColor] : undefined,
+            "--tool-cursor": toolCursorValue,
+          } as CSSProperties
+        }
       >
         <Document
           file={src}
@@ -726,7 +837,7 @@ export function PdfReader({
                   const sel = window.getSelection();
                   if (sel && !sel.isCollapsed) return;
                   // Toggled on the element directly: a hover shouldn't re-render the reader.
-                  e.currentTarget.classList.toggle("is-over-highlight", hitAnnotation(e, n) !== null);
+                  e.currentTarget.classList.toggle("is-over-highlight", !tool && hitAnnotation(e, n) !== null);
                 }}
                 onMouseLeave={(e) => e.currentTarget.classList.remove("is-over-highlight")}
               >
@@ -753,6 +864,7 @@ export function PdfReader({
                       quote={pending.quote}
                       defaultColor={defaultColor}
                       busy={busy}
+                      startNoting={pending.note}
                       onHighlight={(color, comment) => void createHighlight(color, comment)}
                       onDismiss={() => {
                         window.getSelection()?.removeAllRanges();

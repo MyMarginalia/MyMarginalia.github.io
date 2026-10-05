@@ -283,12 +283,12 @@
 }
 
 .pdf-page .textLayer ::selection {
-  background: color-mix(in oklab, #f5d742 25%, transparent);
+  background: color-mix(in oklab, var(--selection-colour, #f5d742) 35%, transparent);
   color: transparent;
 }
 
 .pdf-page .textLayer ::-moz-selection {
-  background: color-mix(in oklab, #f5d742 25%, transparent);
+  background: color-mix(in oklab, var(--selection-colour, #f5d742) 35%, transparent);
   color: transparent;
 }
 
@@ -298,4 +298,16 @@
 .pdf-page.is-over-highlight .textLayer,
 .pdf-page.is-over-highlight .textLayer :is(span, br) {
   cursor: pointer;
+}
+
+/* Highlighter / note tool: the cursor is set on the pane as --tool-cursor.
+   Each pdf.js layer is listed rather than using a blanket `*`, so the popups
+   that sit inside the page keep their normal arrow, I-beam and pointer. */
+.pdf-scroll-pane[data-tool] .pdf-page .react-pdf__Page,
+.pdf-scroll-pane[data-tool] .pdf-page canvas,
+.pdf-scroll-pane[data-tool] .pdf-page .textLayer,
+.pdf-scroll-pane[data-tool] .pdf-page .textLayer :is(span, br, .endOfContent),
+.pdf-scroll-pane[data-tool] .pdf-page .annotationLayer,
+.pdf-scroll-pane[data-tool] .pdf-page .annotationLayer * {
+  cursor: var(--tool-cursor, text);
 }

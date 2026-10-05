@@ -107,16 +107,19 @@ export function NewHighlightMenu({
   quote,
   defaultColor,
   busy,
+  startNoting = false,
   onHighlight,
   onDismiss,
 }: {
   quote: string;
   defaultColor: AnnotationColor;
   busy: boolean;
+  /** Open straight into the note field (the toolbar's Note tool). */
+  startNoting?: boolean;
   onHighlight: (color: AnnotationColor, comment: string | null) => void;
   onDismiss: () => void;
 }) {
-  const [noting, setNoting] = useState(false);
+  const [noting, setNoting] = useState(startNoting);
   const [comment, setComment] = useState("");
   const [color, setColor] = useState<AnnotationColor>(defaultColor);
 
