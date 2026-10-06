@@ -51,6 +51,9 @@ const MENU_WIDTH = 330;
 /** The 100%-zoom page width: a comfortable reading size, never wider than the pane. */
 const MAX_READING_WIDTH = 920;
 
+/** How long a zoom or resize must stop before pages are redrawn sharp at the new size. */
+const RENDER_DEBOUNCE_MS = 120;
+
 /** Horizontal padding inside the scroll pane (px-4 on each side). */
 const PANE_PADDING = 32;
 
@@ -70,6 +73,14 @@ type PendingSelection = {
 };
 
 type FocusedHighlight = { id: string; anchor: Anchor };
+
+/** The part of a pdf.js document this component reads: page count and page sizes. */
+type PdfDocumentLike = {
+  numPages: number;
+  getPage: (n: number) => Promise<{
+    getViewport: (o: { scale: number }) => { width: number; height: number };
+  }>;
+};
 
 /** Space a popup needs before it is moved above the line instead. */
 const MENU_ROOM = 220;
@@ -170,7 +181,6 @@ export function PdfReader({
   const scrollRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const observerRef = useRef<IntersectionObserver | null>(null);
-  const scrollSettleTimer = useRef<number | undefined>(undefined);
 
   const [available, setAvailable] = useState(900);
   const [scrollbarWidth, setScrollbarWidth] = useState(0);
@@ -196,12 +206,27 @@ export function PdfReader({
   // further through a paper you read.
   const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set([1]));
   const [pageAspect, setPageAspect] = useState<number | null>(null);
+  // Pages that aren't shaped like the first one (a landscape figure page).
+  const [pageAspects, setPageAspects] = useState<Record<number, number>>({});
+  const pageAspectRef = useRef<number | null>(null);
+  pageAspectRef.current = pageAspect;
   const [pagePointsHeight, setPagePointsHeight] = useState<number | null>(null);
   // react-pdf's Document caches onItemClick in a ref on first mount and never
   // refreshes it, so a plain closure here would forever see the value from
   // before any page had loaded.
   const pagePointsHeightRef = useRef<number | null>(null);
   pagePointsHeightRef.current = pagePointsHeight;
+  // Every page's height in PDF points, for turning a link destination into a
+  // fraction of its page. Filled by loadPageSizes.
+  const pagePointsRef = useRef<Record<number, number>>({});
+  // Bumped to abandon a size load whose document has gone.
+  const loadToken = useRef(0);
+  useEffect(
+    () => () => {
+      loadToken.current += 1;
+    },
+    [],
+  );
 
   const annotationsByPage = useMemo(() => {
     const map = new Map<number, Annotation[]>();
@@ -249,10 +274,35 @@ export function PdfReader({
   const shownScale = pageWidth / baseWidth;
   const shownScaleRef = useRef(shownScale);
   shownScaleRef.current = shownScale;
+  // Pages are laid out at pageWidth straight away, but only redrawn at
+  // renderWidth, which catches up once zooming or resizing has stopped. Until
+  // then the bitmap already on screen is stretched to fit (see PdfPageView).
+  // At the very start it just follows pageWidth, so the first pages are drawn
+  // once at the measured width rather than at a guess followed by a redraw.
+  const [settledWidth, setSettledWidth] = useState<number | null>(null);
+  // When the wheel last turned. The wait is measured from here rather than just
+  // from the last width change: on a busy machine the next zoom step can be
+  // late, and a timer that only looked at the last step would take that gap for
+  // "zooming has stopped" and start a redraw in the middle of it.
+  const lastWheelAt = useRef(0);
+  useEffect(() => {
+    let timer: number | undefined;
+    const wait = (ms: number) => {
+      timer = window.setTimeout(() => {
+        const idle = performance.now() - lastWheelAt.current;
+        if (idle < RENDER_DEBOUNCE_MS) wait(RENDER_DEBOUNCE_MS - idle);
+        else setSettledWidth(pageWidth);
+      }, ms);
+    };
+    wait(RENDER_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [pageWidth]);
+  const renderWidth = settledWidth ?? pageWidth;
+  const renderScale = renderWidth / baseWidth;
   // Keep a roughly constant rasterized pixel budget regardless of zoom:
-  // pageWidth already grows with zoom, so a flat devicePixelRatio on top of it
+  // the width already grows with zoom, so a flat devicePixelRatio on top of it
   // compounds into several times the pixel area for the same page.
-  const renderDpr = Math.min(4, Math.max(1, Math.max(window.devicePixelRatio || 1, 2) / shownScale));
+  const renderDpr = Math.min(4, Math.max(1, Math.max(window.devicePixelRatio || 1, 2) / renderScale));
 
   const src = useMemo(() => ({ url }), [url]);
   /**
@@ -305,7 +355,12 @@ export function PdfReader({
 
   const scrollToPage = useCallback(
     (n: number, fraction = 0, center = false, behavior: ScrollBehavior = "smooth") => {
-      if (!pageRefs.current[n] || !scrollRef.current) return;
+      const el = pageRefs.current[n];
+      const container = scrollRef.current;
+      if (!el || !container) return;
+      // Mount the target and its neighbours. Every page's box is sized by the
+      // reader, not by what is inside it, so mounting changes no position and
+      // the target can be measured right now.
       setVisiblePages((prev) => {
         const next = new Set(prev);
         next.add(n - 1);
@@ -313,47 +368,9 @@ export function PdfReader({
         next.add(n + 1);
         return next;
       });
-
-      const run = (behavior: ScrollBehavior) => {
-        const el = pageRefs.current[n];
-        const container = scrollRef.current;
-        if (!el || !container) return;
-        const targetY = el.offsetTop - container.offsetTop + fraction * el.offsetHeight;
-        const top = center ? targetY - container.clientHeight / 2 : targetY - 8;
-        if (Math.abs(container.scrollTop - top) < 2) return;
-        container.scrollTo({ top, behavior });
-      };
-
-      // Measure only once the pages just marked visible have mounted: an offset
-      // computed against the pre-mount layout aims at a position that stops
-      // meaning the same thing once they render.
-      requestAnimationFrame(() => {
-        run(behavior);
-        // A page finishing later can still nudge the layout, so keep checking
-        // briefly and correct only while the scroll is at rest — never fighting
-        // the animation or a deliberate scroll. Each check is a no-op on target.
-        if (scrollSettleTimer.current !== undefined) window.clearInterval(scrollSettleTimer.current);
-        let previousTop = -1;
-        let ticks = 0;
-        scrollSettleTimer.current = window.setInterval(() => {
-          const container = scrollRef.current;
-          ticks += 1;
-          if (!container || ticks > 12) {
-            window.clearInterval(scrollSettleTimer.current);
-            scrollSettleTimer.current = undefined;
-            return;
-          }
-          if (container.scrollTop === previousTop) run("auto");
-          previousTop = container.scrollTop;
-        }, 200);
-      });
-    },
-    [],
-  );
-
-  useEffect(
-    () => () => {
-      if (scrollSettleTimer.current !== undefined) window.clearInterval(scrollSettleTimer.current);
+      const targetY = el.offsetTop - container.offsetTop + fraction * el.offsetHeight;
+      const top = center ? targetY - container.clientHeight / 2 : targetY - 8;
+      container.scrollTo({ top, behavior });
     },
     [],
   );
@@ -380,6 +397,13 @@ export function PdfReader({
    * leaving scrollTop at a pixel offset that now means somewhere else.
    */
   const anchorRef = useRef({ y: 0, x: 0.5 });
+  /**
+   * The page, and how far down it, at a third of the way down the pane. Page
+   * sizes can still change after a position is set (a size arriving late), and
+   * pinning the view to "this part of this page" rather than to a pixel offset
+   * keeps the reader on the same text when that happens.
+   */
+  const viewAnchorRef = useRef<{ page: number; fraction: number } | null>(null);
 
   /** Tracks which page is mostly in view so the toolbar counter stays right. */
   const onScroll = useCallback(() => {
@@ -396,6 +420,13 @@ export function PdfReader({
       if (el.offsetTop - container.offsetTop <= mid) current = Number(key);
     }
     setPage(current);
+    const currentHost = pageRefs.current[current];
+    if (currentHost) {
+      viewAnchorRef.current = {
+        page: current,
+        fraction: (mid - (currentHost.offsetTop - container.offsetTop)) / Math.max(1, currentHost.offsetHeight),
+      };
+    }
 
     if (!storageKeyRef.current) return;
     window.clearTimeout(saveTimer.current);
@@ -418,14 +449,186 @@ export function PdfReader({
 
   useEffect(() => () => window.clearTimeout(saveTimer.current), []);
 
-  // Zoom and resize change every page's height; put the viewport back on the
-  // same part of the document.
+  /**
+   * A spot on a page that should stay put under a given point of the pane
+   * through a zoom: which page, how far across and down it (as fractions, so
+   * they hold at any scale), and where in the pane it was.
+   */
+  const zoomAnchorRef = useRef<{
+    page: number;
+    fx: number;
+    fy: number;
+    cx: number;
+    cy: number;
+  } | null>(null);
+  // Bumped by every zoom so the layout effect below runs for it even if the
+  // page width ends up unchanged (a zoom clamped at its limit), and so an
+  // anchor is always used by the commit of the zoom that captured it.
+  const [zoomTick, setZoomTick] = useState(0);
+  const pageWidthRef = useRef(pageWidth);
+  pageWidthRef.current = pageWidth;
+
+  /**
+   * Remembers the part of the document at a screen point — the mouse for a
+   * wheel zoom, the middle of the pane for buttons and keys — so the layout
+   * effect below can put that same part back under that point after the zoom.
+   */
+  const captureZoomAnchor = useCallback((clientX?: number, clientY?: number) => {
+    const pane = scrollRef.current;
+    if (!pane) return;
+    const box = pane.getBoundingClientRect();
+    const x = clientX ?? box.left + box.width / 2;
+    const y = clientY ?? box.top + box.height / 2;
+    // The page under the point; between pages, the one being read.
+    const under = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-page]");
+    const n = under ? Number(under.dataset.page) : pageRef.current;
+    const host = pageRefs.current[n];
+    if (!host) return;
+    const h = host.getBoundingClientRect();
+    if (h.width === 0 || h.height === 0) return;
+    zoomAnchorRef.current = {
+      page: n,
+      fx: (x - h.left) / h.width,
+      fy: (y - h.top) / h.height,
+      cx: x - box.left,
+      cy: y - box.top,
+    };
+  }, []);
+
+  // A page narrower than the pane sits in the middle with nowhere to scroll
+  // to, so a zoom could only ever grow it around its centre and the mouse
+  // would be left behind. While zooming with the wheel the pane therefore
+  // gets extra room at both sides, which is handed back once the zooming
+  // stops. Content is `slack` px further from each edge in the meantime.
+  const [slack, setSlack] = useState(0);
+  const slackRef = useRef(0);
+  const slackTimer = useRef<number | undefined>(undefined);
+  const glideRef = useRef(0);
+  // Where the page's left edge was in the pane when slack was being dropped.
+  const slackFixRef = useRef<number | null>(null);
+
+  const releaseSlack = useCallback(() => {
+    const pane = scrollRef.current;
+    const room = slackRef.current;
+    if (!pane || room === 0) return;
+    const drop = () => {
+      // Dropping the slack moves the page; note where it is, and the layout
+      // effect on `slack` puts it back.
+      const host = pageRefs.current[pageRef.current];
+      slackFixRef.current = host
+        ? host.getBoundingClientRect().left - pane.getBoundingClientRect().left
+        : null;
+      slackRef.current = 0;
+      setSlack(0);
+    };
+    // Without the slack the page can only sit in one of the places it could
+    // sit with no extra room: centred if it is narrower than the pane, else
+    // anywhere that keeps it covering the pane. If it isn't in such a place
+    // now, glide it to the nearest one first so letting go of the wheel
+    // doesn't make it jump.
+    const host = pageRefs.current[pageRef.current];
+    const width = pageWidthRef.current;
+    const viewport = pane.clientWidth;
+    if (!host) {
+      drop();
+      return;
+    }
+    const left = host.getBoundingClientRect().left - pane.getBoundingClientRect().left;
+    const edge = PANE_PADDING / 2;
+    const target =
+      width + PANE_PADDING <= viewport
+        ? (viewport - width) / 2
+        : Math.min(edge, Math.max(viewport - width - edge, left));
+    if (Math.abs(target - left) < 1) {
+      drop();
+      return;
+    }
+    // Scrolling right moves the page left, hence the sign.
+    const from = pane.scrollLeft;
+    const to = Math.max(0, Math.min(from + (left - target), pane.scrollWidth - pane.clientWidth));
+    const start = performance.now();
+    const step = (now: number) => {
+      const k = Math.min(1, (now - start) / 200);
+      pane.scrollLeft = from + (to - from) * (1 - (1 - k) ** 3);
+      if (k < 1) glideRef.current = requestAnimationFrame(step);
+      else drop();
+    };
+    glideRef.current = requestAnimationFrame(step);
+  }, []);
+
+  /**
+   * Every zoom goes through here. With a `pointer` (a wheel zoom) the part of
+   * the page under the mouse stays under it; without one, the middle of the
+   * pane stays put.
+   */
+  const applyZoom = useCallback(
+    (change: () => void, pointer?: { x: number; y: number }) => {
+      const pane = scrollRef.current;
+      window.cancelAnimationFrame(glideRef.current);
+      window.clearTimeout(slackTimer.current);
+      captureZoomAnchor(pointer?.x, pointer?.y);
+      if (pointer && pane && slackRef.current === 0) {
+        slackRef.current = pane.clientWidth;
+        setSlack(pane.clientWidth);
+      }
+      change();
+      setZoomTick((t) => t + 1);
+      if (slackRef.current > 0) slackTimer.current = window.setTimeout(releaseSlack, 500);
+    },
+    [captureZoomAnchor, releaseSlack],
+  );
+
+  useEffect(
+    () => () => {
+      window.clearTimeout(slackTimer.current);
+      window.cancelAnimationFrame(glideRef.current);
+    },
+    [],
+  );
+
+  // Zoom and resize change every page's size. After a zoom, scroll so the
+  // captured spot is back under the pointer; after a plain resize, put the
+  // viewport back on the same part of the document.
   useLayoutEffect(() => {
     const pane = scrollRef.current;
-    if (!pane || anchorRef.current.y <= 0) return;
+    if (!pane) return;
+    const anchor = zoomAnchorRef.current;
+    zoomAnchorRef.current = null;
+    const host = anchor ? pageRefs.current[anchor.page] : null;
+    if (anchor && host) {
+      const box = pane.getBoundingClientRect();
+      const h = host.getBoundingClientRect();
+      pane.scrollLeft += h.left + anchor.fx * h.width - box.left - anchor.cx;
+      pane.scrollTop += h.top + anchor.fy * h.height - box.top - anchor.cy;
+      return;
+    }
+    if (anchorRef.current.y <= 0) return;
     pane.scrollTop = anchorRef.current.y * pane.scrollHeight;
     pane.scrollLeft = anchorRef.current.x * pane.scrollWidth - pane.clientWidth / 2;
-  }, [pageWidth]);
+  }, [pageWidth, zoomTick]);
+
+  // When the slack is dropped, keep the page where the reader last saw it.
+  useLayoutEffect(() => {
+    const pane = scrollRef.current;
+    const left = slackFixRef.current;
+    slackFixRef.current = null;
+    if (!pane || left === null) return;
+    const host = pageRefs.current[pageRef.current];
+    if (!host) return;
+    pane.scrollLeft += host.getBoundingClientRect().left - pane.getBoundingClientRect().left - left;
+  }, [slack]);
+
+  // A page size arriving late (see loadPageSizes) moves everything below it;
+  // pin the view to the same part of the same page.
+  useLayoutEffect(() => {
+    const pane = scrollRef.current;
+    const anchor = viewAnchorRef.current;
+    const host = anchor ? pageRefs.current[anchor.page] : null;
+    if (!pane || !anchor || !host) return;
+    const top =
+      host.offsetTop - pane.offsetTop + anchor.fraction * host.offsetHeight - pane.clientHeight / 3;
+    if (Math.abs(pane.scrollTop - top) >= 1) pane.scrollTop = top;
+  }, [pageAspect, pageAspects]);
 
   // Reopen where the reader left off.
   const restoredRef = useRef(false);
@@ -445,30 +648,44 @@ export function PdfReader({
     }
   }, [numPages, scrollToPage, storageKey]);
 
-  const zoomStep = useCallback((dir: 1 | -1) => {
-    setFitWidth(false);
-    setScale(clampScale(nextZoomStop(shownScaleRef.current, dir)));
-  }, []);
+  const zoomStep = useCallback(
+    (dir: 1 | -1) => {
+      const next = clampScale(nextZoomStop(shownScaleRef.current, dir));
+      applyZoom(() => {
+        shownScaleRef.current = next;
+        setFitWidth(false);
+        setScale(next);
+      });
+    },
+    [applyZoom],
+  );
 
   // Ctrl/Cmd + wheel, and trackpad pinch (which browsers report the same way),
-  // zoom the document rather than the whole browser page. Applied in short
-  // batches because each zoom re-rasterizes the visible pages.
+  // zoom the document towards the mouse rather than the whole browser page.
+  // Applied in short batches because each zoom re-rasterizes the visible pages.
   useEffect(() => {
     const pane = scrollRef.current;
     if (!pane) return;
     let pending = 1;
     let timer: number | undefined;
+    let pointer = { x: 0, y: 0 };
     const flush = () => {
       timer = undefined;
-      const factor = pending;
+      const next = clampScale(shownScaleRef.current * pending);
       pending = 1;
-      setFitWidth(false);
-      setScale(clampScale(shownScaleRef.current * factor));
+      applyZoom(() => {
+        shownScaleRef.current = next;
+        setFitWidth(false);
+        setScale(next);
+      }, pointer);
     };
     const onWheel = (e: WheelEvent) => {
       if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
-      pending *= Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025));
+      lastWheelAt.current = performance.now();
+      // The mouse as it is when the batch is applied, not when it began.
+      pointer = { x: e.clientX, y: e.clientY };
+      pending *= Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.005));
       timer ??= window.setTimeout(flush, 70);
     };
     pane.addEventListener("wheel", onWheel, { passive: false });
@@ -476,7 +693,7 @@ export function PdfReader({
       pane.removeEventListener("wheel", onWheel);
       window.clearTimeout(timer);
     };
-  }, []);
+  }, [applyZoom]);
 
   // + / - / 0 to zoom, unless the person is typing in a field.
   useEffect(() => {
@@ -486,19 +703,82 @@ export function PdfReader({
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
       if (e.key === "+" || e.key === "=") zoomStep(1);
       else if (e.key === "-") zoomStep(-1);
-      else if (e.key === "0") {
-        setFitWidth(false);
-        setScale(1);
-      } else return;
+      else if (e.key === "0")
+        applyZoom(() => {
+          shownScaleRef.current = 1;
+          setFitWidth(false);
+          setScale(1);
+        });
+      else return;
       e.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [zoomStep]);
+  }, [applyZoom, zoomStep]);
+
+  /**
+   * Reads every page's size as soon as the document opens: the first page
+   * before anything is drawn, the rest in the background.
+   *
+   * A page's height sets where every page below it sits, so with sizes known
+   * only as pages happened to load, jumping to somewhere unvisited aimed at an
+   * estimate and then lurched when the real sizes arrived. Knowing them up
+   * front makes a jump land once. Sizes that still arrive late shift nothing
+   * the reader can see (see the layout effect on `pageAspects`).
+   */
+  const loadPageSizes = useCallback(async (pdf: PdfDocumentLike) => {
+    loadToken.current += 1;
+    const token = loadToken.current;
+    const stale = () => token !== loadToken.current;
+    const sizeOf = async (n: number) => {
+      const v = (await pdf.getPage(n)).getViewport({ scale: 1 });
+      return { w: v.width, h: v.height };
+    };
+
+    let baseAspect: number | null = null;
+    try {
+      const first = await sizeOf(1);
+      if (stale()) return;
+      baseAspect = first.w / first.h;
+      pagePointsRef.current = { 1: first.h };
+      setPageAspect(baseAspect);
+      setPagePointsHeight(first.h);
+    } catch {
+      // No size for page 1: sizes will be learned as pages load instead.
+    }
+    setNumPages(pdf.numPages);
+    if (baseAspect === null) return;
+
+    for (let from = 2; from <= pdf.numPages; from += 8) {
+      const numbers = Array.from({ length: Math.min(8, pdf.numPages - from + 1) }, (_, i) => from + i);
+      const sizes = await Promise.all(
+        numbers.map((n) => sizeOf(n).then((s) => ({ n, ...s }), () => null)),
+      );
+      if (stale()) return;
+      const differing: Record<number, number> = {};
+      for (const size of sizes) {
+        if (!size) continue;
+        pagePointsRef.current[size.n] = size.h;
+        const aspect = size.w / size.h;
+        // Only a page unlike the first needs a height of its own.
+        if (Math.abs(aspect - baseAspect) >= 0.002) differing[size.n] = aspect;
+      }
+      if (Object.keys(differing).length > 0) setPageAspects((prev) => ({ ...prev, ...differing }));
+    }
+  }, []);
 
   const handlePageLoadSuccess = useCallback((p: PageLoadInfo) => {
-    setPageAspect((prev) => prev ?? p.width / p.height);
+    const aspect = p.width / p.height;
+    setPageAspect((prev) => prev ?? aspect);
     setPagePointsHeight((prev) => prev ?? p.originalHeight);
+    // Only a page unlike the first needs a height of its own.
+    setPageAspects((prev) => {
+      if (Math.abs(aspect - (pageAspectRef.current ?? aspect)) < 0.002) return prev;
+      const known = prev[p.pageNumber];
+      return known !== undefined && Math.abs(known - aspect) < 0.002
+        ? prev
+        : { ...prev, [p.pageNumber]: aspect };
+    });
   }, []);
 
   /** Places a popup under the last line of `rects` on page `n`, or above it near the pane's foot. */
@@ -750,7 +1030,17 @@ export function PdfReader({
   }
 
   const focusedAnnotation = focused ? annotationById.get(focused.id) : undefined;
-  const placeholderHeight = pageAspect ? pageWidth / pageAspect : pageWidth * 1.3;
+  /**
+   * A page's height at the current zoom, from its shape rather than from its
+   * canvas. The canvas only takes its new size a moment after a zoom, so a box
+   * sized by it would still be measuring the old zoom when the scroll position
+   * is corrected, and the document would lurch instead of zooming towards the
+   * pointer. Sized here, every page changes in the same frame.
+   */
+  const pageHeightFor = (n: number) => {
+    const aspect = pageAspects[n] ?? pageAspect;
+    return aspect ? pageWidth / aspect : pageWidth * 1.3;
+  };
 
   return (
     <div ref={outerRef} className="flex h-full min-h-0 w-full flex-col bg-background">
@@ -761,11 +1051,15 @@ export function PdfReader({
         fitWidth={fitWidth}
         onGoToPage={(n) => scrollToPage(n)}
         onStepPage={stepPage}
-        onSetScale={(next) => {
-          setFitWidth(false);
-          setScale(clampScale(next));
-        }}
-        onFitWidth={() => setFitWidth((v) => !v)}
+        onSetScale={(next) =>
+          applyZoom(() => {
+            const clamped = clampScale(next);
+            shownScaleRef.current = clamped;
+            setFitWidth(false);
+            setScale(clamped);
+          })
+        }
+        onFitWidth={() => applyZoom(() => setFitWidth((v) => !v))}
         header={header}
         tools={
           <HighlightTools
@@ -791,6 +1085,9 @@ export function PdfReader({
         style={
           {
             overflowAnchor: "none",
+            // While zooming the pane has spare room at the sides (see `slack`);
+            // hidden stays scrollable from code but shows no scrollbar flicker.
+            overflowX: slack > 0 ? "hidden" : undefined,
             // While a colour is armed, the drag selection previews that colour.
             "--selection-colour": tool ? HIGHLIGHT_HEX[defaultColor] : undefined,
             "--tool-cursor": toolCursorValue,
@@ -805,11 +1102,18 @@ export function PdfReader({
           // position with no way back but the browser's own history.
           externalLinkTarget="_blank"
           externalLinkRel="noopener noreferrer"
-          onLoadSuccess={({ numPages: n }) => setNumPages(n)}
+          onLoadSuccess={(pdf) => void loadPageSizes(pdf)}
           onLoadError={() => setFailed(true)}
           onItemClick={({ dest, pageNumber }) => {
             dismiss();
-            scrollToPage(pageNumber, destTopFraction(dest, pagePointsHeightRef.current), true);
+            // A link is a jump, not a scroll: a smooth animation across several
+            // pages is slow and, mid-flight, shows pages that are still loading.
+            scrollToPage(
+              pageNumber,
+              destTopFraction(dest, pagePointsRef.current[pageNumber] ?? pagePointsHeightRef.current),
+              true,
+              "instant",
+            );
           }}
           loading={
             <div className="flex items-center gap-2 p-8 text-sm text-muted-foreground">
@@ -822,7 +1126,10 @@ export function PdfReader({
               column grows with it, so the page stays fully scrollable. A
               plain centred column overflows equally on both sides and the
               left edge becomes unreachable. */}
-          <div className="flex w-fit min-w-full flex-col items-center gap-3 px-4 py-4">
+          <div
+            className="flex w-fit min-w-full flex-col items-center gap-3 py-4"
+            style={{ paddingLeft: PANE_PADDING / 2 + slack, paddingRight: PANE_PADDING / 2 + slack }}
+          >
             {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => (
               <div
                 key={n}
@@ -831,7 +1138,8 @@ export function PdfReader({
                   pageRefs.current[n] = el;
                   if (el) observerRef.current?.observe(el);
                 }}
-                className="pdf-page relative w-fit shadow-[0_1px_3px_rgba(0,0,0,0.2),0_6px_20px_rgba(0,0,0,0.12)]"
+                className="pdf-page relative shrink-0 bg-white shadow-[0_1px_3px_rgba(0,0,0,0.2),0_6px_20px_rgba(0,0,0,0.12)]"
+                style={{ width: pageWidth, height: pageHeightFor(n) }}
                 onClick={(e) => handlePageClick(e, n)}
                 onMouseMove={(e) => {
                   const sel = window.getSelection();
@@ -845,7 +1153,8 @@ export function PdfReader({
                   pageNumber={n}
                   isVisible={visiblePages.has(n)}
                   pageWidth={pageWidth}
-                  placeholderHeight={placeholderHeight}
+                  renderWidth={renderWidth}
+                  placeholderHeight={pageHeightFor(n)}
                   renderDpr={renderDpr}
                   onLoadSuccess={handlePageLoadSuccess}
                   annotations={annotationsByPage.get(n) ?? NO_ANNOTATIONS}

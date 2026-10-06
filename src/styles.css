@@ -232,6 +232,20 @@
 /* Highlights sit under the text layer so text stays crisp and selectable.
    Hit-testing for hover and clicks is done in JS against the stored rects,
    since the text layer above would swallow the events either way. */
+/* One drawing of a page (see PdfPageView): laid out at the width it was drawn
+   at and scaled to the page's current width, so the bitmap, text layer and link
+   boxes keep their proportions while a redraw is pending. */
+.pdf-page .pdf-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+
+.pdf-page .react-pdf__Page__canvas {
+  display: block;
+}
+
 .pdf-highlight-layer {
   position: absolute;
   inset: 0;
