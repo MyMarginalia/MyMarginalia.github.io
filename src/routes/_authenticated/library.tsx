@@ -546,6 +546,8 @@ function PaperCard({
   const [showAbstract, setShowAbstract] = useState(false);
   const [showNotes, setShowNotes] = useState(false);
   const [notes, setNotes] = useState(item.notes ?? "");
+  // Whitespace alone isn't a note.
+  const hasNotes = Boolean(item.notes?.trim());
 
   return (
     <article className="flex flex-col rounded-md border border-border bg-card p-4">
@@ -619,10 +621,17 @@ function PaperCard({
           type="button"
           onClick={() => setShowNotes((v) => !v)}
           aria-expanded={showNotes}
-          className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-muted-foreground hover:text-foreground"
+          className={cn(
+            "inline-flex items-center gap-1 rounded border px-2 py-1 transition-colors",
+            // Green once there are notes, the same "done" green as Recommend,
+            // so a card with notes stands out at a glance.
+            hasNotes
+              ? "border-status-read/40 bg-status-read/15 text-status-read"
+              : "border-border text-muted-foreground hover:text-foreground",
+          )}
         >
           <NotebookPen className="h-3.5 w-3.5" />
-          {item.notes ? "Notes" : "Add notes"}
+          {hasNotes ? "Notes taken" : "Add notes"}
         </button>
       </div>
 
