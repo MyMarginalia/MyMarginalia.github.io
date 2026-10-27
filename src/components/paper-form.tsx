@@ -70,7 +70,7 @@ export function PaperFormDialog({
       }));
       toast.success("Metadata filled in.");
     },
-    onError: () => toast.error("Lookup failed."),
+    onError: (err) => toast.error(err instanceof Error && err.message ? err.message : "Lookup failed."),
   });
 
   const save = useMutation({
